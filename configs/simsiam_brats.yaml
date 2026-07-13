@@ -1,0 +1,37 @@
+# SimSiam SSL pretraining config for BraTS 2021 (T1, T1ce, T2, FLAIR).
+# Every key here can be overridden on the command line, e.g.
+#   python -m braintumor_ssl.train_simsiam --config configs/simsiam_brats.yaml --epochs 200 --batch_size 16
+
+# ----- data -----
+data_root: BraTS2021/BraTS2021_TrainingSet   # scanned recursively for subject folders
+splits_file: splits/splits.json              # produced by make_splits.py
+modalities: [t1, t1ce, t2, flair]            # channel order fed to the encoder (4 channels)
+roi_size: [96, 96, 96]                       # random-crop patch size for SSL views
+num_workers: 8
+cache_rate: 0.0                              # >0 caches decoded volumes in RAM (needs memory)
+
+# ----- model -----
+backbone: resnet18        # resnet18 (512-d) | resnet34 | resnet50 (2048-d)
+feature_dim: 256          # dim of the transferable representation h (docx: "Hasta x 256 Features")
+proj_dim: 256             # SimSiam projector output (z)
+proj_hidden_dim: 512      # projector hidden width
+pred_hidden_dim: 128      # predictor bottleneck width
+
+# ----- optimization -----
+optimizer: sgd            # sgd (SimSiam paper) | adamw
+base_lr: 0.05             # LR is scaled linearly: lr = base_lr * batch_size / 256
+weight_decay: 1.0e-4
+momentum: 0.9
+epochs: 200
+batch_size: 16
+warmup_epochs: 10
+fix_pred_lr: true         # keep predictor LR constant (SimSiam paper appendix)
+amp: true                 # mixed precision (only used on CUDA)
+grad_clip: 0.0            # >0 clips grad-norm; cheap insurance for early-iteration spikes
+
+# ----- run -----
+out_dir: checkpoints/simsiam_brats
+seed: 42
+save_every: 20            # epochs between periodic checkpoints
+log_every: 10             # iterations between console logs
+resume: null              # path to checkpoint to resume from

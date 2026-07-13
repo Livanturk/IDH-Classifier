@@ -1,0 +1,10 @@
+*.pycache
+BraTS2021/
+checkpoints/
+scripts/
+splits/
+BrainTumor.docx
+BraTS2021.zip
+CLAUDE.md
+Haberlşeme.txt
+UH1.zip

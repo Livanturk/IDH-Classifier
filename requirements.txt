@@ -1,0 +1,11 @@
+# Core deps for SimSiam SSL pretraining on BraTS 2021.
+# torch / monai / numpy / pyyaml / scikit-learn / tqdm are already present in the
+# cluster conda env; nibabel is the only one that had to be added (--user).
+torch>=2.1
+monai>=1.3
+nibabel>=5.0
+numpy>=1.24
+pyyaml>=6.0
+scikit-learn>=1.2
+tqdm>=4.65
+pandas>=2.0

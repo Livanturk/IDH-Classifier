@@ -1,0 +1,111 @@
+"""3D ResNet backbone + SimSiam head (projector / predictor) and loss.
+
+Design (faithful to Chen & He, "Exploring Simple Siamese Representation Learning", CVPR 2021,
+adapted to 3D multi-modal MRI):
+
+    x (B, 4, D, H, W)
+        -> backbone (MONAI 3D ResNet, global-avg-pooled)      -> f  (backbone_dim)
+        -> encoder linear + BN                                -> h  (feature_dim = 256)   [transferable feature]
+        -> projector MLP (3-layer, BN)                        -> z  (proj_dim)
+        -> predictor MLP (2-layer, bottleneck)                -> p  (proj_dim)
+
+    loss = -0.5 * ( cos(p1, stopgrad(z2)) + cos(p2, stopgrad(z1)) )
+
+Downstream feature extraction returns `h` (the encoder output, 256-d) — the transferable
+representation used by the IDH classifier. `f`/`z` are exposed too for ablations.
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from monai.networks.nets import resnet18, resnet34, resnet50
+
+_BACKBONES = {"resnet18": resnet18, "resnet34": resnet34, "resnet50": resnet50}
+
+
+def build_backbone(name: str, in_channels: int) -> tuple[nn.Module, int]:
+    """Return a MONAI 3D ResNet with its classification head removed, plus its output dim."""
+    if name not in _BACKBONES:
+        raise ValueError(f"unknown backbone {name!r}; choose from {list(_BACKBONES)}")
+    net = _BACKBONES[name](
+        spatial_dims=3,
+        n_input_channels=in_channels,
+        num_classes=1,          # replaced below; only affects the discarded fc
+        feed_forward=True,
+        shortcut_type="B",
+        bias_downsample=False,
+    )
+    net.fc = nn.Identity()      # forward now returns the global-avg-pooled feature vector
+    with torch.no_grad():
+        dummy = torch.zeros(1, in_channels, 32, 32, 32)
+        out_dim = net(dummy).shape[1]
+    return net, out_dim
+
+
+def _mlp(dims: list[int], last_bn: bool, relu_last: bool = False) -> nn.Sequential:
+    layers: list[nn.Module] = []
+    for i in range(len(dims) - 1):
+        is_last = i == len(dims) - 2
+        layers.append(nn.Linear(dims[i], dims[i + 1], bias=not (is_last and last_bn)))
+        if not is_last:
+            layers.append(nn.BatchNorm1d(dims[i + 1]))
+            layers.append(nn.ReLU(inplace=True))
+        else:
+            if last_bn:
+                layers.append(nn.BatchNorm1d(dims[i + 1], affine=False))  # SimSiam: no affine on final proj BN
+            if relu_last:
+                layers.append(nn.ReLU(inplace=True))
+    return nn.Sequential(*layers)
+
+
+class SimSiam(nn.Module):
+    def __init__(
+        self,
+        backbone: str = "resnet18",
+        in_channels: int = 4,
+        feature_dim: int = 256,
+        proj_dim: int = 256,
+        proj_hidden_dim: int = 512,
+        pred_hidden_dim: int = 128,
+    ):
+        super().__init__()
+        self.backbone, backbone_dim = build_backbone(backbone, in_channels)
+        self.backbone_dim = backbone_dim
+        self.feature_dim = feature_dim
+
+        # Encoder head: backbone feature -> 256-d transferable representation h.
+        self.encoder_head = nn.Sequential(
+            nn.Linear(backbone_dim, feature_dim, bias=False),
+            nn.BatchNorm1d(feature_dim),
+            nn.ReLU(inplace=True),
+        )
+        # Projection MLP (3-layer) : h -> z
+        self.projector = _mlp([feature_dim, proj_hidden_dim, proj_hidden_dim, proj_dim], last_bn=True)
+        # Prediction MLP (2-layer bottleneck) : z -> p
+        self.predictor = _mlp([proj_dim, pred_hidden_dim, proj_dim], last_bn=False)
+
+    # --- representation used downstream -------------------------------------
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Transferable 256-d feature h for a batch (used for IDH feature extraction)."""
+        return self.encoder_head(self.backbone(x))
+
+    # --- SSL forward --------------------------------------------------------
+    def forward(self, x1: torch.Tensor, x2: torch.Tensor):
+        h1, h2 = self.encode(x1), self.encode(x2)
+        z1, z2 = self.projector(h1), self.projector(h2)
+        p1, p2 = self.predictor(z1), self.predictor(z2)
+        return {"p1": p1, "p2": p2, "z1": z1, "z2": z2, "h1": h1, "h2": h2}
+
+
+def simsiam_loss(out: dict[str, torch.Tensor]) -> torch.Tensor:
+    """Symmetric negative cosine similarity with stop-gradient on the targets."""
+
+    def d(p: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        z = z.detach()
+        p = F.normalize(p, dim=1)
+        z = F.normalize(z, dim=1)
+        return -(p * z).sum(dim=1).mean()
+
+    return 0.5 * d(out["p1"], out["z2"]) + 0.5 * d(out["p2"], out["z1"])
