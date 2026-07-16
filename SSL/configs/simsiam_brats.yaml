@@ -6,7 +6,14 @@
 data_root: BraTS2021/BraTS2021_TrainingSet   # scanned recursively for subject folders
 splits_file: splits/splits.json              # produced by make_splits.py
 modalities: [t1, t1ce, t2, flair]            # channel order fed to the encoder (4 channels)
-roi_size: [96, 96, 96]                       # random-crop patch size for SSL views
+roi_size: [96, 96, 96]                       # patch size; pick data-driven size via adaptive_crop.py
+crop_mode: brain                             # brain | tumor | tumor_margin (seg used only to locate the crop)
+tumor_margin: 16                             # voxels of context around the WT bbox (crop_mode=tumor_margin)
+center_mode: wt_centroid                     # wt_centroid | bbox_center (tumor mode)
+mask_out_non_tumor: false                    # tumor modes: zero out non-tumour voxels inside the crop
+clip_percentiles: [0.5, 99.5]                # foreground intensity clip before z-score (null to disable)
+aug_preset: auto                             # standard | gentle | auto (gentle geometry when masked)
+normalize_after_crop: false                  # true = z-score on the (masked) ROI (notebook order); false = whole brain
 num_workers: 8
 cache_rate: 0.0                              # >0 caches decoded volumes in RAM (needs memory)
 

@@ -113,8 +113,8 @@ per subject for a more robust vector.
 |---|---|---|
 | SSL method | **SimSiam** | specified by docx; no negatives → small-batch friendly for 3D |
 | Backbone | 3D ResNet-18 | good capacity/memory trade-off; resnet50 optional |
-| Input | 4 ch [t1,t1ce,t2,flair], `96³` random crop | brain-bbox crop keeps tumour context, fits GPU memory |
-| Normalization | per-volume, per-channel z-score on brain voxels | intensities vary ~30× across modalities/subjects |
+| Input | 4 ch [t1,t1ce,t2,flair], `96³` crop | brain-bbox crop keeps tumour context, fits GPU memory (pick size via `adaptive_crop.py`) |
+| Normalization | per-channel nonzero z-score + `[0.5, 99.5]` foreground clip | intensities vary ~30× across modalities/subjects; clip tames outliers |
 | Feature dim `h` | **256** | matches "Hasta × 256 Features" |
 | Optimizer | **SGD**, momentum 0.9, wd 1e-4 | SimSiam paper; `adamw` also available |
 | LR | `base_lr 0.05 × batch/256`, cosine + 10-epoch warmup | SimSiam linear scaling rule |
@@ -124,31 +124,80 @@ per subject for a more robust vector.
 | AMP | on (CUDA) | halves memory, faster |
 
 ### Augmentations (two views per subject, `braintumor_ssl/data.py`)
-Random crop, flips (3 axes), 90° rotations, small affine, Gaussian noise/smooth,
-intensity scale/shift, gamma contrast, coarse dropout. Structure-preserving so the
-two views remain the *same anatomy* under different appearance.
+Two presets, selected by `aug_preset` (`standard` | `gentle` | `auto`):
+- **standard** (whole-brain / context ROIs): in-plane flips (axes 0/1 @0.3; **no z /
+  superior-inferior flip** — anatomically implausible), 90° rotations, ~15° affine,
+  Gaussian noise/smooth, intensity scale/shift, gamma, coarse dropout.
+- **gentle** (WT-masked / small tumour ROIs): in-plane flips + ~5° affine + low-noise + smooth, and the
+  **intensity** augs kept strong (scale/shift/gamma) — but **no 90° rotation and no coarse
+  dropout**, which would implausibly distort or erase a small masked tumour.
+- **auto** (default): `gentle` when `mask_out_non_tumor=True`, else `standard`.
+
+Rationale: SSL needs strong augmentation, but for a tumour-only ROI the *safe* strong augs are
+intensity/appearance (they model scanner/protocol variation without cutting the tumour), while
+aggressive geometry is risky — so we keep intensity strong and soften geometry only when masked.
 
 ---
 
 ## Ablation ladder (comparing configs)
 
-3D SSL is expensive, so we use a disciplined **2×2 ladder** (backbone × UPenn), not a grid.
-Each config differs from the baseline on **one axis**; auto-generated under `configs/`:
+3D SSL is expensive, so we use a disciplined ladder (single-axis changes from the
+baseline), not a grid. Auto-generated under `configs/`:
 
-| config | backbone | pretraining data |
-|---|---|---|
-| `simsiam_r18_all` (baseline) | ResNet-18 | all 1251 (train 1188) |
-| `simsiam_r50_all` | ResNet-50 | all 1251 |
-| `simsiam_r18_noupenn` | ResNet-18 | UPENN-GBM excluded (train 806) |
-| `simsiam_r50_noupenn` | ResNet-50 | UPENN-GBM excluded |
+| config | backbone | pretraining data | crop_mode |
+|---|---|---|---|
+| `simsiam_r18_all` (baseline) | ResNet-18 | all 1251 (train 1188) | brain |
+| `simsiam_r50_all` | ResNet-50 | all 1251 | brain |
+| `simsiam_r18_noupenn` | ResNet-18 | UPENN-GBM excluded (train 806) | brain |
+| `simsiam_r50_noupenn` | ResNet-50 | UPENN-GBM excluded | brain |
+| `simsiam_r18_all_tumor` | ResNet-18 | all 1251 | **tumor_margin** |
+
+Axes: **backbone** (R18↔R50), **leakage** (UPenn in/out), **field-of-view** (`brain` vs
+`tumor_margin`).
 
 ```bash
-for c in simsiam_r18_all simsiam_r50_all simsiam_r18_noupenn simsiam_r50_noupenn; do
+for c in simsiam_r18_all simsiam_r50_all simsiam_r18_noupenn simsiam_r50_noupenn simsiam_r18_all_tumor; do
     python -m braintumor_ssl.train_simsiam --config configs/$c.yaml   # -> checkpoints/$c/last.pth
 done
 ```
 (Run these as separate GPU/SLURM jobs. If ResNet-50 OOMs, lower `--batch_size`; the LR
 auto-scales.)
+
+### `crop_mode` — where the patch comes from
+
+The network input is **always** the 4 intensity channels; `crop_mode` only sets *where* the
+patch is taken. Segmentation, when used, produces only a crop location — it never enters the tensor.
+
+| `crop_mode` | crop location | needs seg? |
+|---|---|---|
+| `brain` (default) | random patch in the brain bbox | no |
+| `tumor` | roi box centred on the WT centroid (or `bbox_center`) | yes (locator only) |
+| `tumor_margin` | WT bbox + `tumor_margin` voxels, resized to roi | yes (locator only) |
+
+Extra knobs (config): `center_mode` (`wt_centroid` | `bbox_center`), and
+`mask_out_non_tumor` (tumour modes only — zeroes every non-tumour voxel inside the crop, i.e.
+the WT-masked ROI the team's notebook produces).
+
+Feature extraction re-reads all of these from the checkpoint, so inputs stay consistent with
+pretraining. Tumour modes need a mask per subject at extraction time too (present for BraTS/
+UPenn/UCSF-PDGM; auto-generate, e.g. nnU-Net, for raw external cohorts).
+
+### Choosing `roi_size` from the data (`adaptive_crop.py`)
+
+Instead of hardcoding 96³, pick the crop size from the whole-tumour box distribution
+(reproduces the team's Untitled17 notebook: WT geometry → percentile → round-up → coverage):
+
+```bash
+python -m braintumor_ssl.adaptive_crop --splits_file splits/splits.json --split train
+# -> recommended roi_size (e.g. [112,112,112]) + a coverage table (% subjects whose WT
+#    bbox fully fits each candidate crop). Put the chosen size in your config's roi_size.
+```
+
+**Masking caveat.** `mask_out_non_tumor=True` keeps only tumour voxels. It maximises focus but
+discards peritumoral context (edema, T2-FLAIR mismatch — which correlate with IDH) and makes
+deep features share radiomics' exact support, risking *more redundancy* (vs the docx's
+complementarity goal). Recommended to run it as an **ablation** against a context-preserving
+mode (`brain` / `tumor_margin` unmasked), not as the only setting.
 
 ## How to compare configs — which encoder is "better"?
 

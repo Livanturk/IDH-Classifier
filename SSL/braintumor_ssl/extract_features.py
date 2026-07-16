@@ -22,7 +22,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
-from braintumor_ssl.data import BraTSViews, load_splits, scan_subjects
+from braintumor_ssl.data import load_splits, make_views, scan_subjects
 from braintumor_ssl.models import SimSiam
 from braintumor_ssl.utils import recompute_bn_stats
 
@@ -54,7 +54,9 @@ def main() -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     ck = torch.load(args.checkpoint, map_location=device)
     cfg = ck["cfg"]
-    roi = tuple(args.roi_size) if args.roi_size else tuple(cfg["roi_size"])
+    if args.roi_size:                       # optional override -> make_views reads cfg["roi_size"]
+        cfg["roi_size"] = list(args.roi_size)
+    roi = tuple(cfg["roi_size"])
 
     model = SimSiam(
         backbone=cfg["backbone"], in_channels=len(cfg["modalities"]),
@@ -76,12 +78,12 @@ def main() -> None:
 
     mode = "train" if args.tta_crops > 0 else "eval"   # 'train' mode yields fresh random crops each pass
     n_passes = args.tta_crops if args.tta_crops > 0 else 1
-    ds = BraTSViews(records, modalities=cfg["modalities"], roi_size=roi, mode=mode)
+    ds = make_views(records, cfg, mode=mode)
     ld = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
     if args.recompute_bn:
         # deterministic eval-view loader to re-estimate BatchNorm stats on this cohort
-        bn_ds = BraTSViews(records, modalities=cfg["modalities"], roi_size=roi, mode="eval")
+        bn_ds = make_views(records, cfg, mode="eval")
         bn_ld = DataLoader(bn_ds, batch_size=max(args.batch_size, 2), shuffle=True,
                            drop_last=True, num_workers=args.num_workers)
         nb = recompute_bn_stats(model, bn_ld, device, max_batches=200)

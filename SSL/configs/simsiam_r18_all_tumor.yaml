@@ -1,9 +1,10 @@
 # AUTO-GENERATED ablation config (base: configs/simsiam_brats.yaml).
-# Ablation ladder: backbone {resnet18|resnet50} x UPenn {included|excluded}.
+# Axes: backbone {resnet18|resnet50} x UPenn {included|excluded} x crop_mode {brain|tumor_margin}.
+# crop_mode=tumor_margin uses seg ONLY to locate the crop (never as network input).
 # NOTE: if resnet50 OOMs on your GPU, lower batch_size (LR auto-scales with it).
 
 data_root: BraTS2021/BraTS2021_TrainingSet
-splits_file: splits/splits_noupenn.json
+splits_file: splits/splits.json
 modalities:
 - t1
 - t1ce
@@ -13,6 +14,8 @@ roi_size:
 - 96
 - 96
 - 96
+crop_mode: tumor_margin
+tumor_margin: 16
 num_workers: 8
 cache_rate: 0.0
 backbone: resnet18
@@ -30,7 +33,7 @@ warmup_epochs: 10
 fix_pred_lr: true
 amp: true
 grad_clip: 0.0
-out_dir: checkpoints/simsiam_r18_noupenn
+out_dir: checkpoints/simsiam_r18_all_tumor
 seed: 42
 save_every: 20
 log_every: 10

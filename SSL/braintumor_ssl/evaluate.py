@@ -31,7 +31,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
-from braintumor_ssl.data import BraTSViews, load_splits, scan_subjects
+from braintumor_ssl.data import load_splits, make_views, scan_subjects
 from braintumor_ssl.models import SimSiam
 from braintumor_ssl.utils import (
     alignment,
@@ -67,7 +67,7 @@ def resolve_ckpt(p: str) -> str:
 @torch.no_grad()
 def features_two_views(model, records, cfg, roi, device, bs, nw):
     """Return (H1, H2, ids, collections) — two augmented-view embeddings per subject."""
-    ds = BraTSViews(records, modalities=cfg["modalities"], roi_size=roi, mode="train")
+    ds = make_views(records, cfg, mode="train")
     ld = DataLoader(ds, batch_size=bs, shuffle=False, num_workers=nw)
     H1, H2, ids = [], [], []
     for batch in ld:
@@ -132,7 +132,7 @@ def main() -> None:
                         pred_hidden_dim=cfg["pred_hidden_dim"]).to(device)
         model.load_state_dict(ck["model"])
 
-        bn_ds = BraTSViews(records, modalities=cfg["modalities"], roi_size=roi, mode="eval")
+        bn_ds = make_views(records, cfg, mode="eval")
         bn_ld = DataLoader(bn_ds, batch_size=max(args.batch_size, 2), shuffle=True,
                            drop_last=True, num_workers=args.num_workers)
         recompute_bn_stats(model, bn_ld, device, max_batches=200)

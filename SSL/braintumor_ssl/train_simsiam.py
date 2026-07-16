@@ -18,7 +18,7 @@ import torch
 import yaml
 from torch.utils.data import DataLoader
 
-from braintumor_ssl.data import BraTSViews, load_splits
+from braintumor_ssl.data import load_splits, make_views
 from braintumor_ssl.models import SimSiam, simsiam_loss
 from braintumor_ssl.utils import (
     AverageMeter,
@@ -38,6 +38,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--splits_file")
     ap.add_argument("--modalities", nargs="+")
     ap.add_argument("--roi_size", nargs=3, type=int)
+    ap.add_argument("--crop_mode", choices=["brain", "tumor", "tumor_margin"])
+    ap.add_argument("--tumor_margin", type=int)
+    ap.add_argument("--center_mode", choices=["wt_centroid", "bbox_center"])
+    ap.add_argument("--mask_out_non_tumor", action="store_true", default=None)
+    ap.add_argument("--aug_preset", choices=["standard", "gentle", "auto"])
+    ap.add_argument("--normalize_after_crop", action="store_true", default=None)
     ap.add_argument("--num_workers", type=int)
     ap.add_argument("--backbone")
     ap.add_argument("--feature_dim", type=int)
@@ -101,12 +107,11 @@ def main() -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     roi = tuple(cfg["roi_size"])
     print(f"[cfg] device={device} backbone={cfg['backbone']} roi={roi} "
-          f"batch={cfg['batch_size']} feature_dim={cfg['feature_dim']}")
+          f"crop_mode={cfg.get('crop_mode','brain')} batch={cfg['batch_size']} feature_dim={cfg['feature_dim']}")
 
     # ---- data ----
     split = load_splits(cfg["splits_file"])
-    train_ds = BraTSViews(split["train"], modalities=cfg["modalities"], roi_size=roi,
-                          mode="train", cache=bool(cfg.get("cache")))
+    train_ds = make_views(split["train"], cfg, mode="train", cache=bool(cfg.get("cache")))
     train_ld = DataLoader(
         train_ds, batch_size=cfg["batch_size"], shuffle=True, drop_last=True,
         num_workers=cfg["num_workers"], pin_memory=(device == "cuda"),
