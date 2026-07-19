@@ -1,11 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
 *.pycache
+
+# Large imaging data — NEVER commit (this is what broke the push)
 BraTS2021/
-checkpoints/
-scripts/
-splits/
-BrainTumor.docx
-BraTS2021.zip
-CLAUDE.md
-Haberlşeme.txt
-UH1.zip
 UCSF-PGDM/
+UCSF-PDGM/
+
+# Machine-specific / local artifacts
+SSL/BraTS2021
+SSL/checkpoints/
+SSL/scripts/
+SSL/splits/
+CLAUDE.md
+commands.txt

@@ -17,6 +17,29 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+def resolve_device(spec=None) -> str:
+    """Resolve a device spec to 'cuda' or 'cpu', pinning the chosen GPU as current.
+
+    spec: None -> auto (GPU 0 if available, else CPU); 'cpu'; a GPU index like 0/'1'/'2';
+    or 'cuda'/'cuda:N'. Returns the device *type* ('cuda' or 'cpu') and calls
+    torch.cuda.set_device(N) so every plain 'cuda' tensor lands on the requested GPU — this
+    keeps all the existing `device == "cuda"` checks working while supporting `--device N`.
+    """
+    if not torch.cuda.is_available():
+        if spec not in (None, "cpu"):
+            print(f"[warn] --device {spec} requested but CUDA is unavailable; using CPU")
+        return "cpu"
+    if spec is None or spec == "cuda":
+        return "cuda"                       # default GPU (cuda:0)
+    if spec == "cpu":
+        return "cpu"
+    idx = int(str(spec).replace("cuda:", ""))
+    if not 0 <= idx < torch.cuda.device_count():
+        raise SystemExit(f"--device {spec}: GPU {idx} out of range (have {torch.cuda.device_count()})")
+    torch.cuda.set_device(idx)
+    return "cuda"
+
+
 class AverageMeter:
     """Running average of a scalar."""
 
@@ -100,13 +123,22 @@ def representation_std(z: torch.Tensor) -> float:
 # --------------------------------------------------------------------------- #
 # Label-free representation-quality metrics (for comparing SSL checkpoints)
 # --------------------------------------------------------------------------- #
+def _svdvals(x: torch.Tensor) -> torch.Tensor:
+    """Singular values, with a CPU retry if the (GPU) LAPACK/cuSOLVER driver fails to converge
+    on a degenerate/ill-conditioned matrix (common when N << d or features nearly collapse)."""
+    try:
+        return torch.linalg.svdvals(x)
+    except Exception:
+        return torch.linalg.svdvals(x.cpu())
+
+
 def rankme(Z: torch.Tensor, eps: float = 1e-7) -> float:
     """RankMe (Garrido et al. 2023): effective rank via singular-value entropy.
 
     Range [1, min(N, d)]; HIGHER = richer, less-degenerate representation.
     Correlates with downstream transfer and needs no labels.
     """
-    s = torch.linalg.svdvals(Z.float())
+    s = _svdvals(Z.float())
     p = s / (s.sum() + eps) + eps
     return float(torch.exp(-(p * p.log()).sum()))
 
@@ -130,9 +162,13 @@ def uniformity(Z: torch.Tensor, t: float = 2.0) -> float:
 
 
 def participation_ratio(Z: torch.Tensor) -> float:
-    """Effective dimensionality (sum(lambda)^2 / sum(lambda^2)) of the feature
-    covariance. HIGHER = variance spread across more directions (max = d)."""
+    """Effective dimensionality (sum(lambda)^2 / sum(lambda^2)) of the feature covariance.
+    HIGHER = variance spread across more directions (max = d).
+
+    Computed from the singular values of the centered features (lambda = s^2), not eigvalsh
+    of the covariance: SVD is numerically robust to the rank-deficient N << d case (few val
+    subjects, 256-d features), where eigvalsh can fail to converge. The value is identical for
+    well-conditioned inputs (the (n-1) covariance scale cancels in the ratio)."""
     z = Z.float() - Z.float().mean(0, keepdim=True)
-    cov = (z.T @ z) / max(z.shape[0] - 1, 1)
-    ev = torch.linalg.eigvalsh(cov).clamp(min=0)
+    ev = _svdvals(z).pow(2)
     return float((ev.sum() ** 2) / (ev.pow(2).sum() + 1e-12))

@@ -20,27 +20,40 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from monai.networks.nets import resnet18, resnet34, resnet50
+from monai.networks.nets import DenseNet121, resnet18, resnet34, resnet50
 
-_BACKBONES = {"resnet18": resnet18, "resnet34": resnet34, "resnet50": resnet50}
+_RESNETS = {"resnet18": resnet18, "resnet34": resnet34, "resnet50": resnet50}
+BACKBONES = (*_RESNETS, "densenet121")   # valid `backbone:` config values
 
 
 def build_backbone(name: str, in_channels: int) -> tuple[nn.Module, int]:
-    """Return a MONAI 3D ResNet with its classification head removed, plus its output dim."""
-    if name not in _BACKBONES:
-        raise ValueError(f"unknown backbone {name!r}; choose from {list(_BACKBONES)}")
-    net = _BACKBONES[name](
-        spatial_dims=3,
-        n_input_channels=in_channels,
-        num_classes=1,          # replaced below; only affects the discarded fc
-        feed_forward=True,
-        shortcut_type="B",
-        bias_downsample=False,
-    )
-    net.fc = nn.Identity()      # forward now returns the global-avg-pooled feature vector
+    """Return a MONAI 3D backbone with its classification head removed, plus its output dim.
+
+    ResNets expose the global-avg-pooled feature by setting `.fc = Identity`; DenseNet121 by
+    replacing its final classifier linear (`class_layers.out`) with Identity. The encoder head
+    then maps whatever the backbone width is (512 for r18/r34, 2048 for r50, 1024 for densenet121)
+    to the shared 256-d transferable feature, so backbones are interchangeable via config.
+    """
+    if name in _RESNETS:
+        net = _RESNETS[name](
+            spatial_dims=3,
+            n_input_channels=in_channels,
+            num_classes=1,          # replaced below; only affects the discarded fc
+            feed_forward=True,
+            shortcut_type="B",
+            bias_downsample=False,
+        )
+        net.fc = nn.Identity()      # forward now returns the global-avg-pooled feature vector
+    elif name == "densenet121":
+        net = DenseNet121(spatial_dims=3, in_channels=in_channels, out_channels=1)
+        net.class_layers.out = nn.Identity()   # drop the classifier -> pooled 1024-d feature
+    else:
+        raise ValueError(f"unknown backbone {name!r}; choose from {list(BACKBONES)}")
+    was_training = net.training
+    net.eval()                      # eval-mode probe: BN uses running stats (safe at batch/spatial 1)
     with torch.no_grad():
-        dummy = torch.zeros(1, in_channels, 32, 32, 32)
-        out_dim = net(dummy).shape[1]
+        out_dim = net(torch.zeros(2, in_channels, 32, 32, 32)).shape[1]
+    net.train(was_training)
     return net, out_dim
 
 

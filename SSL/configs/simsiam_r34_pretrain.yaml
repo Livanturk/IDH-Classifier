@@ -1,0 +1,62 @@
+# Backbone comparison [2/3]: resnet34 | adaptive-clinical WT recipe | clean pretraining split.
+# The three configs simsiam_{r18,r34,densenet121}_pretrain.yaml are IDENTICAL except `backbone`
+# and `out_dir`, so the comparison is fair (same data / ROI / augmentation / schedule / batch).
+# Split excludes UCSF-PDGM (external test set) and UPENN-GBM (downstream IDH cohort).
+# Compare the finished runs (label-free) with:
+#   python -m braintumor_ssl.evaluate --split val --splits_file splits/splits_pretrain.json --embed tsne \
+#     --checkpoints checkpoints/simsiam_r34_pretrain/best.pth \
+#                   checkpoints/simsiam_r34_pretrain/best.pth \
+#                   checkpoints/simsiam_densenet121_pretrain/best.pth
+
+# ----- data -----
+data_root: BraTS2021/BraTS2021_TrainingSet
+splits_file: splits/splits_pretrain.json   # 585 subjects, NO UCSF-PDGM / UPENN-GBM (556 train / 29 val)
+modalities: [t1, t1ce, t2, flair]
+roi_size: [128, 128, 128]        # p95 WT cube on the train split (adaptive_crop.py: ~89% full WT coverage)
+crop_mode: tumor                 # roi box centred on the WT centroid (seg used only to locate/mask the ROI)
+tumor_margin: 16                 # unused in crop_mode=tumor (kept for a clean cfg dict)
+center_mode: wt_centroid
+mask_out_non_tumor: true         # zero out non-tumour voxels inside the crop
+clip_percentiles: [0.5, 99.5]
+aug_preset: clinical             # mask-preserving gentle augmentation (keeps the WT-masked zero background)
+normalize_after_crop: true       # z-score on the masked ROI (raw -> crop -> mask-out -> normalize)
+num_workers: 12
+cache_rate: 0.0
+
+# ----- model -----
+backbone: resnet34               # <<< the ONLY axis that varies across the 3 comparison configs
+feature_dim: 256
+proj_dim: 256
+proj_hidden_dim: 512
+pred_hidden_dim: 128
+
+# ----- optimization -----
+optimizer: sgd
+base_lr: 0.05
+weight_decay: 1.0e-4
+momentum: 0.9
+epochs: 200
+batch_size: 16                   # H100 94GB fits more; if you raise it, raise it on ALL 3 (fair) — LR auto-scales
+warmup_epochs: 10
+fix_pred_lr: true
+amp: true
+grad_clip: 1.0
+
+# ----- run -----
+out_dir: checkpoints/simsiam_r34_pretrain
+seed: 42
+save_every: 20
+log_every: 10
+resume: null
+
+# ----- label-free validation monitoring -----
+val_every: 5                     # validate + save best.pth (by RankMe) every 5 epochs
+min_delta_rankme: 0.05
+early_stop: false                # OFF: run all 3 to the same epoch budget, then compare best.pth
+patience: 20
+min_epochs: 50
+collapse_stop: true              # abort a run that collapses (z_std < z_std_min for collapse_patience evals)
+collapse_patience: 3
+z_std_min: 0.01
+rankme_min: 5.0
+pr_min: 5.0

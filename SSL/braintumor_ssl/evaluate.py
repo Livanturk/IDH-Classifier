@@ -102,6 +102,35 @@ def save_embedding(H: np.ndarray, cols: list[str], path: str, method: str) -> No
     fig.tight_layout(); fig.savefig(path, dpi=120); plt.close(fig)
 
 
+def save_spectrum(spectra: dict, path: str) -> None:
+    """Overlaid feature singular-value spectra (normalized, log-y). A flat / slowly-decaying
+    spectrum = variance spread over many directions (high effective rank); a steep cliff = a
+    few dominant directions (dimensional collapse). Visual companion to RankMe."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    for name, H in spectra.items():
+        X = H.float()
+        X = X - X.mean(0, keepdim=True)
+        try:
+            s = torch.linalg.svdvals(X)
+        except Exception:
+            s = torch.linalg.svdvals(X.cpu())
+        s = (s / s.max()).cpu().numpy()
+        ax.plot(range(1, len(s) + 1), s, lw=1.6, label=name)
+    ax.set_yscale("log")
+    ax.set_xlabel("singular-value index")
+    ax.set_ylabel("normalized σ (log)")
+    ax.set_title("Feature singular-value spectrum (flatter = higher rank)")
+    ax.grid(alpha=0.3, which="both")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
@@ -119,6 +148,7 @@ def main() -> None:
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     rows = []
+    spectra: dict[str, torch.Tensor] = {}
     for ckpt_arg in args.checkpoints:
         ckpt = resolve_ckpt(ckpt_arg)
         ck = torch.load(ckpt, map_location=device)
@@ -140,6 +170,7 @@ def main() -> None:
 
         H1, H2, ids, cols = features_two_views(model, records, cfg, roi, device,
                                                args.batch_size, args.num_workers)
+        spectra[name] = H1
         row = {
             "config": name,
             "backbone": cfg["backbone"],
@@ -173,6 +204,10 @@ def main() -> None:
     if os.path.exists(args.out):
         df = pd.concat([pd.read_csv(args.out), df], ignore_index=True)
     df.to_csv(args.out, index=False)
+    if spectra:
+        spec_path = os.path.join(os.path.dirname(args.out) or ".", "singular_value_spectrum.png")
+        save_spectrum(spectra, spec_path)
+        print(f"[plot] {spec_path}")
     print("\n=== leaderboard (higher rankme / participation, more-negative uniformity = better) ===")
     print(df.sort_values("rankme", ascending=False).to_string(index=False))
     print(f"\n[done] {args.out}")

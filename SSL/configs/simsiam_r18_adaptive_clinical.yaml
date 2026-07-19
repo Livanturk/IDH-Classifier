@@ -1,0 +1,57 @@
+# Reference-recipe config: adaptive WT-centred ROI + clinical (mask-preserving) augmentation
+# + RankMe-monitored training with collapse control and best-checkpoint selection.
+# This reproduces the team's `brats_adaptive_roi_simsiam` pipeline inside the repo's
+# config-driven architecture. seg is used ONLY to locate/mask the ROI, never as network input.
+
+# ----- data -----
+data_root: BraTS2021/BraTS2021_TrainingSet
+splits_file: splits/splits.json
+modalities: [t1, t1ce, t2, flair]
+roi_size: [128, 128, 128]        # p95 WT cube on the 1188-subject train split (adaptive_crop.py: fully covers WT in 89.1%); re-run adaptive_crop for other splits
+crop_mode: tumor                 # roi box centred on the whole-tumour centroid (seg used to locate only)
+tumor_margin: 16                 # unused in crop_mode=tumor (kept for a clean cfg dict)
+center_mode: wt_centroid         # crop centre = WT centroid (reference default)
+mask_out_non_tumor: true         # zero out non-tumour voxels inside the crop
+clip_percentiles: [0.5, 99.5]    # foreground intensity clip before z-score
+aug_preset: clinical             # mask-preserving gentle augmentation (keeps the WT-masked zero background)
+normalize_after_crop: true       # z-score on the masked ROI (raw -> crop -> mask-out -> normalize)
+num_workers: 8
+cache_rate: 0.0
+
+# ----- model -----
+backbone: resnet18
+feature_dim: 256
+proj_dim: 256
+proj_hidden_dim: 512
+pred_hidden_dim: 128
+
+# ----- optimization -----
+optimizer: sgd
+base_lr: 0.05
+weight_decay: 1.0e-4
+momentum: 0.9
+epochs: 200
+batch_size: 16                   # lower for a larger roi if it OOMs (LR auto-scales)
+warmup_epochs: 10
+fix_pred_lr: true
+amp: true
+grad_clip: 1.0                   # reference clips grad-norm to 1.0
+
+# ----- run -----
+out_dir: checkpoints/simsiam_r18_adaptive_clinical
+seed: 42
+save_every: 20
+log_every: 10
+resume: null
+
+# ----- label-free validation monitoring (reference recipe: on) -----
+val_every: 1                     # validate + save best.pth by RankMe every epoch
+min_delta_rankme: 0.05
+early_stop: true                 # stop when RankMe plateaus for `patience` evals (after min_epochs)
+patience: 15
+min_epochs: 25
+collapse_stop: true              # stop after `collapse_patience` collapsed evals in a row
+collapse_patience: 3
+z_std_min: 0.01                  # collapse thresholds (auto-relaxed when val < 10 subjects)
+rankme_min: 5.0
+pr_min: 5.0

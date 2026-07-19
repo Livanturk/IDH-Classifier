@@ -21,6 +21,7 @@ from typing import Optional
 import nibabel as nib
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 from monai.transforms import (
@@ -180,13 +181,24 @@ def _resize(x: torch.Tensor, roi) -> torch.Tensor:
 
 
 def _center_crop(x: torch.Tensor, center, roi) -> torch.Tensor:
-    """roi-sized box centred at `center` (voxel coords), zero-padded past the edges."""
+    """roi-sized box centred at `center` (voxel coords), zero-padded past the edges.
+
+    When the volume is at least roi-sized on an axis, the window is clamped to lie fully
+    inside it, so a crop centre near the edge (e.g. a whole-tumour centroid close to the
+    brain boundary) still yields a complete in-view crop instead of a half-empty padded one.
+    This matches the coverage assumed by adaptive_crop.py's `_crop_start`. Axes smaller than
+    roi are centred and zero-padded as before; brain-mode random crops already choose in-range
+    centres, so their output is unchanged.
+    """
     out = x.new_zeros((x.shape[0], *roi))
     src = [slice(None)]
     dst = [slice(None)]
     for d in range(3):
+        dim = x.shape[d + 1]
         start = int(round(center[d])) - roi[d] // 2
-        s0, s1 = max(start, 0), min(start + roi[d], x.shape[d + 1])
+        if dim >= roi[d]:
+            start = min(max(start, 0), dim - roi[d])   # keep the whole window inside the volume
+        s0, s1 = max(start, 0), min(start + roi[d], dim)
         d0 = s0 - start
         src.append(slice(s0, s1))
         dst.append(slice(d0, d0 + (s1 - s0)))
@@ -230,10 +242,66 @@ def _tumor_margin_crop(x, wt_mask, tumor, roi, margin, rng, training, mask_out) 
     return _resize(img, roi)
 
 
-AUG_PRESETS = ("standard", "gentle", "auto")
+AUG_PRESETS = ("standard", "gentle", "clinical", "auto")
 
 
-def make_appearance_transforms(roi_size, preset: str = "standard") -> Compose:
+class ClinicalTransform:
+    """Gentle, mask-preserving SSL augmentation for tumour ROIs (torch, applied per view).
+
+    Faithful to the team's `ClinicalSSLTransform`: soft L-R / A-P flips plus channel-wise
+    intensity scale/shift, light Gaussian noise and light blur — deliberately no 90-deg
+    rotation, cutout, z-axis flip or large deformation, which would distort or erase a small
+    masked tumour. Every op is confined to the originally-nonzero voxels and the background is
+    re-zeroed afterwards, so a WT-masked ROI keeps its exact zero background. (The MONAI
+    intensity presets do NOT: RandShiftIntensity / RandGaussianNoise would leak signal into
+    the masked-out region.) Pair with crop_mode=tumor + mask_out_non_tumor + normalize_after_crop.
+
+    Input/output: a (C, H, W, D) tensor. Spatial flips use axes 1, 2 (H, W); axis 3 (D,
+    superior-inferior) is never flipped, consistent with the other presets.
+    """
+
+    def __init__(
+        self,
+        flip_prob: float = 0.25,
+        scale_prob: float = 0.5,
+        shift_prob: float = 0.5,
+        noise_prob: float = 0.3,
+        blur_prob: float = 0.15,
+        noise_std: float = 0.03,
+        scale_range: tuple[float, float] = (0.9, 1.1),
+        shift_range: tuple[float, float] = (-0.1, 0.1),
+    ):
+        self.flip_prob = flip_prob
+        self.scale_prob = scale_prob
+        self.shift_prob = shift_prob
+        self.noise_prob = noise_prob
+        self.blur_prob = blur_prob
+        self.noise_std = noise_std
+        self.scale_range = scale_range
+        self.shift_range = shift_range
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        x = torch.as_tensor(x).float().clone()
+        if torch.rand(1).item() < self.flip_prob:
+            x = torch.flip(x, dims=[1])                       # H (L-R / A-P)
+        if torch.rand(1).item() < self.flip_prob:
+            x = torch.flip(x, dims=[2])                       # W
+        nonzero = x != 0                                      # (masked) background to preserve
+        if torch.rand(1).item() < self.scale_prob:
+            s = torch.empty(x.shape[0], 1, 1, 1).uniform_(*self.scale_range)
+            x = torch.where(nonzero, x * s, x)               # channel-wise intensity scale
+        if torch.rand(1).item() < self.shift_prob:
+            b = torch.empty(x.shape[0], 1, 1, 1).uniform_(*self.shift_range)
+            x = torch.where(nonzero, x + b, x)               # channel-wise intensity shift
+        if torch.rand(1).item() < self.noise_prob:
+            x = torch.where(nonzero, x + torch.randn_like(x) * self.noise_std, x)
+        if torch.rand(1).item() < self.blur_prob:
+            blurred = F.avg_pool3d(x.unsqueeze(0), kernel_size=3, stride=1, padding=1).squeeze(0)
+            x = torch.where(nonzero, blurred, x)
+        return torch.where(nonzero, x, torch.zeros_like(x))  # guarantee the background stays 0
+
+
+def make_appearance_transforms(roi_size, preset: str = "standard"):
     """Appearance/geometry augmentations applied AFTER the spatial crop (per view).
 
     preset:
@@ -241,7 +309,11 @@ def make_appearance_transforms(roi_size, preset: str = "standard") -> Compose:
       * "gentle"   — WT-masked / small tumour ROIs: soft geometry (no 90-deg rot, no cutout,
                      ~5-deg affine, low-noise) but intensity augmentation kept strong, so the
                      SSL signal stays ("same tumour under different scanner/intensity/noise").
+      * "clinical" — like "gentle" but mask-preserving (see ClinicalTransform): keeps a
+                     WT-masked ROI's zero background exact. This is the reference-recipe preset.
     """
+    if preset == "clinical":
+        return ClinicalTransform()
     if preset == "gentle":
         return Compose(
             [

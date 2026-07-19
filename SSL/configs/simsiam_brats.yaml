@@ -18,7 +18,7 @@ num_workers: 8
 cache_rate: 0.0                              # >0 caches decoded volumes in RAM (needs memory)
 
 # ----- model -----
-backbone: resnet18        # resnet18 (512-d) | resnet34 | resnet50 (2048-d)
+backbone: resnet18        # resnet18/resnet34 (512-d) | resnet50 (2048-d) | densenet121 (1024-d)
 feature_dim: 256          # dim of the transferable representation h (docx: "Hasta x 256 Features")
 proj_dim: 256             # SimSiam projector output (z)
 proj_hidden_dim: 512      # projector hidden width
@@ -42,3 +42,18 @@ seed: 42
 save_every: 20            # epochs between periodic checkpoints
 log_every: 10             # iterations between console logs
 resume: null              # path to checkpoint to resume from
+
+# ----- label-free validation monitoring (optional) -----
+# val_every > 0 evaluates the split's val subjects every N epochs (loss + RankMe / z_std /
+# participation / alignment / uniformity), appends metrics.csv, and saves best.pth by RankMe.
+# It never changes the training trajectory or last.pth. early_stop / collapse_stop are opt-in.
+val_every: 10             # 0 = off; the reference recipe uses 1 (see simsiam_r18_adaptive_clinical.yaml)
+min_delta_rankme: 0.05    # min RankMe gain that counts as an improvement (best.pth / patience)
+early_stop: false         # stop once RankMe plateaus for `patience` evals (only after min_epochs)
+patience: 20
+min_epochs: 50
+collapse_stop: false      # stop after `collapse_patience` collapsed evals in a row
+collapse_patience: 3
+z_std_min: 0.01           # collapse thresholds (auto-relaxed to tiny values when val < 10 subjects)
+rankme_min: 5.0
+pr_min: 5.0
