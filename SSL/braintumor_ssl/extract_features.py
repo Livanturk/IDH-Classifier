@@ -24,7 +24,7 @@ from torch.utils.data import DataLoader
 
 from braintumor_ssl.data import load_splits, make_views, scan_subjects
 from braintumor_ssl.models import SimSiam
-from braintumor_ssl.utils import recompute_bn_stats
+from braintumor_ssl.utils import recompute_bn_stats, use_local_tmpdir
 
 
 def parse_args() -> argparse.Namespace:
@@ -50,6 +50,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    use_local_tmpdir()                       # avoid the NFS DataLoader-cleanup noise on the cluster
     args = parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     ck = torch.load(args.checkpoint, map_location=device)

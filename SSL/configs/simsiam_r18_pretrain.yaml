@@ -50,13 +50,24 @@ log_every: 10
 resume: null
 
 # ----- label-free validation monitoring -----
-val_every: 5                     # validate + save best.pth (by RankMe) every 5 epochs
+val_every: 5                     # validate + save best.pth every 5 epochs
 min_delta_rankme: 0.05
-early_stop: false                # OFF: run all 3 to the same epoch budget, then compare best.pth
-patience: 20
+# best.pth = highest RankMe *among converged* epochs. The gate below blocks the trap where RankMe
+# is highest at random init (untrained scatter inflates effective rank) — without it best.pth
+# latches onto an early, essentially-untrained epoch. An epoch is eligible only once the SSL loss
+# shows real learning: val_loss near the -1 floor AND the two views actually align.
+best_val_loss_max: -0.8          # eligible only if val_loss <= this (converged)
+best_align_max: 0.15             # and alignment <= this (views mapped together, not random spread)
+early_stop: true                 # 5) stop when RankMe plateaus for `patience` validations (each = val_every epochs)
+patience: 15
 min_epochs: 50
 collapse_stop: true              # abort a run that collapses (z_std < z_std_min for collapse_patience evals)
 collapse_patience: 3
 z_std_min: 0.01
 rankme_min: 5.0
 pr_min: 5.0
+
+# ----- experiment tracking (MLflow -> DagsHub) -----
+# default URI: https://dagshub.com/alilivanturk/IDH-Classifier.mlflow (credentials stay in the env)
+mlflow: true
+mlflow_experiment: simsiam-brats-backbones

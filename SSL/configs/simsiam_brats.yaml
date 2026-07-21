@@ -45,10 +45,13 @@ resume: null              # path to checkpoint to resume from
 
 # ----- label-free validation monitoring (optional) -----
 # val_every > 0 evaluates the split's val subjects every N epochs (loss + RankMe / z_std /
-# participation / alignment / uniformity), appends metrics.csv, and saves best.pth by RankMe.
-# It never changes the training trajectory or last.pth. early_stop / collapse_stop are opt-in.
+# participation / alignment / uniformity), appends metrics.csv, and saves best.pth by RankMe
+# *among converged epochs*. It never changes the training trajectory or last.pth. early_stop /
+# collapse_stop are opt-in.
 val_every: 10             # 0 = off; the reference recipe uses 1 (see simsiam_r18_adaptive_clinical.yaml)
 min_delta_rankme: 0.05    # min RankMe gain that counts as an improvement (best.pth / patience)
+best_val_loss_max: -0.8   # best.pth convergence gate: eligible only if val_loss <= this ...
+best_align_max: 0.15      # ... AND alignment <= this (RankMe peaks at random init; this blocks it)
 early_stop: false         # stop once RankMe plateaus for `patience` evals (only after min_epochs)
 patience: 20
 min_epochs: 50
@@ -57,3 +60,12 @@ collapse_patience: 3
 z_std_min: 0.01           # collapse thresholds (auto-relaxed to tiny values when val < 10 subjects)
 rankme_min: 5.0
 pr_min: 5.0
+
+# ----- experiment tracking (optional; MLflow -> DagsHub) -----
+# mlflow: true logs per-epoch metrics + figures (training_curves.png, metrics.csv). The server and
+# credentials come from the ENVIRONMENT (never commit a token):
+#   export MLFLOW_TRACKING_URI=https://dagshub.com/alilivanturk/IDH-Classifier.mlflow
+#   export MLFLOW_TRACKING_USERNAME=<dagshub-username>
+#   export MLFLOW_TRACKING_PASSWORD=<dagshub-token>
+mlflow: false
+mlflow_experiment: simsiam-brats

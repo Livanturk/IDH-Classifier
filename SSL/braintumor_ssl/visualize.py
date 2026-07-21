@@ -215,6 +215,17 @@ def _load_run_metrics(run_dirs, labels):
     return out
 
 
+def _log_figs(args, paths) -> None:
+    if not getattr(args, "mlflow", False):
+        return
+    from braintumor_ssl.tracking import Tracker
+    tk = Tracker({"mlflow": True, "mlflow_experiment": args.mlflow_experiment},
+                 run_name=f"visualize-{args.mode}")
+    for p in paths:
+        tk.log_artifact(p, artifact_path="figures")
+    tk.close()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("mode", choices=["curves", "roi"])
@@ -225,6 +236,8 @@ def main() -> None:
     ap.add_argument("--split", default="val", choices=["train", "val"])
     ap.add_argument("--n", type=int, default=4, help="roi: #subjects in the montage")
     ap.add_argument("--out", default="results/figures")
+    ap.add_argument("--mlflow", action="store_true", help="also log the figures to MLflow/DagsHub")
+    ap.add_argument("--mlflow_experiment", default="simsiam-brats")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
@@ -234,8 +247,11 @@ def main() -> None:
         run_dfs = _load_run_metrics(args.runs, args.labels)
         if not run_dfs:
             raise SystemExit("no metrics.csv found in any --runs entry")
-        save_curves_comparison(run_dfs, os.path.join(args.out, "training_comparison.png"))
-        save_final_bars(run_dfs, os.path.join(args.out, "final_metrics_bars.png"))
+        c1 = os.path.join(args.out, "training_comparison.png")
+        c2 = os.path.join(args.out, "final_metrics_bars.png")
+        save_curves_comparison(run_dfs, c1)
+        save_final_bars(run_dfs, c2)
+        _log_figs(args, [c1, c2])
         print(f"[done] wrote training_comparison.png + final_metrics_bars.png to {args.out}")
         return
 
@@ -250,12 +266,14 @@ def main() -> None:
     mods = list(cfg["modalities"])
     ds_eval = make_views(records, cfg, mode="eval")
     rois = {ds_eval[i]["id"]: ds_eval[i]["image"].numpy() for i in range(len(records))}
-    save_roi_montage(rois, mods, os.path.join(args.out, "roi_montage.png"))
+    montage = os.path.join(args.out, "roi_montage.png")
+    aug = os.path.join(args.out, "augmentation_views.png")
+    save_roi_montage(rois, mods, montage)
 
     ds_train = make_views(records[:1], cfg, mode="train")
     item = ds_train[0]
-    save_aug_views(rois[records[0]["id"]], item["view1"].numpy(), item["view2"].numpy(),
-                   mods, os.path.join(args.out, "augmentation_views.png"))
+    save_aug_views(rois[records[0]["id"]], item["view1"].numpy(), item["view2"].numpy(), mods, aug)
+    _log_figs(args, [montage, aug])
     print(f"[done] wrote roi_montage.png + augmentation_views.png to {args.out}")
 
 

@@ -2,6 +2,10 @@
 __pycache__/
 *.py[cod]
 *.pycache
+.env
+.env.*
+!.env.example
+mlruns/
 
 # Large imaging data — NEVER commit (this is what broke the push)
 BraTS2021/
@@ -13,5 +17,12 @@ SSL/BraTS2021
 SSL/checkpoints/
 SSL/scripts/
 SSL/splits/
+
+# Generated SSL experiment outputs (metrics, embeddings and visualizations)
+SSL/features/
+SSL/results/
+SSL/figures/
+SSL/artifacts/
+SSL/runs/
 CLAUDE.md
 commands.txt

@@ -41,6 +41,7 @@ from braintumor_ssl.utils import (
     representation_std,
     set_seed,
     uniformity,
+    use_local_tmpdir,
 )
 
 
@@ -57,6 +58,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--batch_size", type=int, default=8)
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--mlflow", action="store_true", help="log leaderboard + figures to MLflow/DagsHub")
+    ap.add_argument("--mlflow_experiment", default="simsiam-brats-eval")
     return ap.parse_args()
 
 
@@ -132,6 +135,7 @@ def save_spectrum(spectra: dict, path: str) -> None:
 
 
 def main() -> None:
+    use_local_tmpdir()                       # avoid the NFS DataLoader-cleanup noise on the cluster
     args = parse_args()
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -210,6 +214,28 @@ def main() -> None:
         print(f"[plot] {spec_path}")
     print("\n=== leaderboard (higher rankme / participation, more-negative uniformity = better) ===")
     print(df.sort_values("rankme", ascending=False).to_string(index=False))
+
+    if args.mlflow:
+        from braintumor_ssl.tracking import Tracker
+
+        result_dir = os.path.dirname(args.out) or "."
+        metric_keys = ("z_std", "rankme", "alignment", "uniformity", "particip_ratio")
+        # One MLflow run per checkpoint makes DagsHub's run comparison view useful.
+        for row in rows:
+            tk = Tracker(
+                {"mlflow": True, "mlflow_experiment": args.mlflow_experiment},
+                run_name=f"evaluate-{row['config']}",
+                tags={"stage": "evaluation", "backbone": row["backbone"]},
+            )
+            tk.log_params({k: v for k, v in row.items() if k not in metric_keys})
+            tk.log_metrics({k: row[k] for k in metric_keys}, step=int(row["epoch"]))
+            tk.log_artifact(args.out, artifact_path="tables")
+            tk.log_artifact(os.path.join(result_dir, f"{row['config']}_{args.embed}.png"),
+                            artifact_path="figures")
+            tk.log_artifact(os.path.join(result_dir, "singular_value_spectrum.png"),
+                            artifact_path="figures")
+            tk.close()
+
     print(f"\n[done] {args.out}")
 
 

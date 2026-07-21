@@ -40,6 +40,26 @@ def resolve_device(spec=None) -> str:
     return "cuda"
 
 
+def use_local_tmpdir() -> None:
+    """Point tempfile / multiprocessing temp dirs at node-local /dev/shm so the DataLoader worker
+    cleanup at process exit stops hitting the harmless-but-noisy NFS race that prints
+    ``OSError: [Errno 16] Device or resource busy: '.nfsXXXX'`` (this cluster's /tmp is NFS-mounted;
+    the .nfs silly-rename files can't be unlinked while still open). Respects an existing TMPDIR,
+    is best-effort, and never raises — call it once at the start of a CLI entrypoint."""
+    import tempfile
+
+    if os.environ.get("TMPDIR"):
+        return                               # respect an explicit (presumably local) TMPDIR
+    try:
+        d = f"/dev/shm/pymp-{os.getuid()}"
+        os.makedirs(d, exist_ok=True)
+        if os.access(d, os.W_OK):
+            os.environ["TMPDIR"] = d
+            tempfile.tempdir = None          # force tempfile.gettempdir() to re-read TMPDIR
+    except Exception:
+        pass
+
+
 class AverageMeter:
     """Running average of a scalar."""
 

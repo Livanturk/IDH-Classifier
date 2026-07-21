@@ -9,3 +9,7 @@ pyyaml>=6.0
 scikit-learn>=1.2
 tqdm>=4.65
 pandas>=2.0
+matplotlib>=3.6            # training-curve / ROI / spectrum figures (visualize.py, evaluate.py)
+mlflow>=2.9.2             # optional experiment tracking -> DagsHub (enable with mlflow: true; creds via env)
+psutil>=5.9               # optional MLflow CPU/RAM system metrics
+nvidia-ml-py>=12.0        # optional MLflow NVIDIA GPU system metrics (imports as pynvml)

@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader
 
 from braintumor_ssl.data import load_splits, make_views
 from braintumor_ssl.models import SimSiam, simsiam_loss
+from braintumor_ssl.tracking import Tracker
 from braintumor_ssl.utils import (
     AverageMeter,
     alignment,
@@ -35,6 +36,7 @@ from braintumor_ssl.utils import (
     scaled_lr,
     set_seed,
     uniformity,
+    use_local_tmpdir,
 )
 
 
@@ -76,11 +78,22 @@ def parse_args() -> argparse.Namespace:
     # label-free validation monitoring (0 = off; saves best.pth by RankMe when > 0)
     ap.add_argument("--val_every", type=int)
     ap.add_argument("--min_delta_rankme", type=float)
+    # best.pth convergence gate: only rank an epoch by RankMe once it has genuinely learned
+    ap.add_argument("--best_val_loss_max", type=float,
+                    help="epoch eligible for best.pth only if val_loss <= this (default -0.8)")
+    ap.add_argument("--best_align_max", type=float,
+                    help="and alignment <= this (default 0.15); blocks the high-RankMe random-init epoch")
     ap.add_argument("--early_stop", action="store_true", default=None)
     ap.add_argument("--patience", type=int)
     ap.add_argument("--min_epochs", type=int)
     ap.add_argument("--collapse_stop", action="store_true", default=None)
     ap.add_argument("--collapse_patience", type=int)
+    # experiment tracking (MLflow -> DagsHub); URI + credentials come from the environment
+    ap.add_argument("--mlflow", action="store_true", default=None)
+    ap.add_argument("--mlflow_experiment")
+    ap.add_argument("--mlflow_system_metrics", action="store_true", default=None,
+                    help="also log CPU/RAM/GPU utilization (requires psutil; pynvml for GPU)")
+    ap.add_argument("--no_mlflow", action="store_true", help="force-disable tracking (timing/debug runs)")
     ap.add_argument("--resume")
     ap.add_argument("--cache", action="store_true", default=None)
     ap.add_argument("--smoke", action="store_true", help="cap iterations/epoch for a fast dry run")
@@ -91,11 +104,13 @@ def load_config(args: argparse.Namespace) -> dict:
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
     for k, v in vars(args).items():
-        if k in ("config", "smoke"):
+        if k in ("config", "smoke", "no_mlflow"):
             continue
         if v is not None:
             cfg[k] = v
     cfg["smoke"] = args.smoke
+    if args.no_mlflow:                 # explicit off wins over the config's mlflow: true
+        cfg["mlflow"] = False
     return cfg
 
 
@@ -211,6 +226,17 @@ def is_collapsed(m: dict, th: dict) -> tuple[bool, str]:
     return False, "ok"
 
 
+def is_converged(m: dict, cfg: dict) -> bool:
+    """Best-checkpoint eligibility gate: only rank an epoch by RankMe once the encoder has
+    actually learned view-invariance. Without this, RankMe is *highest at random init* — the
+    untrained encoder scatters features across all dims, inflating effective rank — so a pure
+    max-RankMe rule saves an early, essentially-untrained epoch as best.pth. Convergence is read
+    from the SSL loss itself: val_loss near -1 (negative-cosine floor) and low alignment (the two
+    views actually map together) both signal genuine learning, not random spread."""
+    return (m["val_loss"] <= cfg.get("best_val_loss_max", -0.8)
+            and m["alignment"] <= cfg.get("best_align_max", 0.15))
+
+
 def write_metrics_csv(path: str, rows: list[dict]) -> None:
     if not rows:
         return
@@ -221,7 +247,9 @@ def write_metrics_csv(path: str, rows: list[dict]) -> None:
 
 
 def main() -> None:
-    cfg = load_config(parse_args())
+    use_local_tmpdir()                       # avoid the NFS DataLoader-cleanup noise on the cluster
+    args = parse_args()
+    cfg = load_config(args)
     set_seed(cfg["seed"])
     device = resolve_device(cfg.get("device"))
     dev_label = f"cuda:{torch.cuda.current_device()}" if device == "cuda" else device
@@ -272,6 +300,13 @@ def main() -> None:
     best_rankme, best_epoch, no_improve, collapse_run = -float("inf"), -1, 0, 0
     metrics_history: list[dict] = []
 
+    # optional experiment tracking (MLflow -> DagsHub); no-op unless cfg['mlflow'] is true
+    tracker = Tracker(cfg, run_name=os.path.basename(os.path.normpath(cfg["out_dir"])),
+                      tags={"backbone": cfg["backbone"], "crop_mode": cfg.get("crop_mode", "brain")})
+    tracker.log_params(cfg)
+    tracker.log_dict(cfg, "config/resolved_config.json")
+    tracker.log_artifact(args.config, artifact_path="config")
+
     # ---- train ----
     for epoch in range(start_epoch, cfg["epochs"]):
         model.train()
@@ -307,6 +342,8 @@ def main() -> None:
         expected = 1.0 / (cfg["feature_dim"] ** 0.5)
         print(f"[epoch {epoch:03d}] loss={loss_m.avg:+.4f} z_std={std_m.avg:.4f} "
               f"(healthy~{expected:.4f}) time={time.time()-t0:.1f}s")
+        tracker.log_metrics({"train_loss": loss_m.avg, "train_z_std": std_m.avg,
+                             "lr": optimizer.param_groups[0]["lr"]}, step=epoch)
 
         is_last = epoch == cfg["epochs"] - 1
         if is_last or (epoch + 1) % cfg["save_every"] == 0:
@@ -324,28 +361,36 @@ def main() -> None:
             vm = validate(model, val_records, cfg, device, use_amp)
             th = collapse_thresholds(vm["n_val"], cfg)
             collapsed, why = is_collapsed(vm, th)
+            converged = is_converged(vm, cfg)
             print(f"[val {epoch:03d}] loss={vm['val_loss']:+.4f} z_std={vm['z_std']:.4f} "
                   f"rankme={vm['rankme']:.3f} pr={vm['participation_ratio']:.2f} "
                   f"align={vm['alignment']:.4f} unif={vm['uniformity']:+.3f} "
-                  f"collapsed={collapsed}" + ("" if not collapsed else f" ({why})"))
+                  f"converged={converged} collapsed={collapsed}" + ("" if not collapsed else f" ({why})"))
             metrics_history.append({
                 "epoch": epoch, "train_loss": round(loss_m.avg, 5), "train_z_std": round(std_m.avg, 5),
                 "val_loss": round(vm["val_loss"], 5), "z_std": round(vm["z_std"], 5),
                 "rankme": round(vm["rankme"], 4), "participation_ratio": round(vm["participation_ratio"], 4),
                 "alignment": round(vm["alignment"], 5), "uniformity": round(vm["uniformity"], 5),
-                "n_val": vm["n_val"], "collapsed": collapsed,
+                "n_val": vm["n_val"], "converged": converged, "collapsed": collapsed,
             })
             write_metrics_csv(os.path.join(cfg["out_dir"], "metrics.csv"), metrics_history)
+            tracker.log_metrics({"val_loss": vm["val_loss"], "z_std": vm["z_std"], "rankme": vm["rankme"],
+                                 "participation_ratio": vm["participation_ratio"],
+                                 "alignment": vm["alignment"], "uniformity": vm["uniformity"]}, step=epoch)
 
-            improved = (not collapsed) and math.isfinite(vm["rankme"]) \
-                and vm["rankme"] > best_rankme + cfg.get("min_delta_rankme", 0.0)
+            # best.pth = highest RankMe *among converged, non-collapsed* epochs. The convergence
+            # gate is what stops best.pth from latching onto the high-RankMe random-init epoch.
+            eligible = converged and (not collapsed) and math.isfinite(vm["rankme"])
+            improved = eligible and vm["rankme"] > best_rankme + cfg.get("min_delta_rankme", 0.0)
             if improved:
                 best_rankme, best_epoch, no_improve = vm["rankme"], epoch, 0
                 save_checkpoint({"epoch": epoch, "model": model.state_dict(),
                                  "optimizer": optimizer.state_dict(), "cfg": cfg, "val_metrics": vm},
                                 os.path.join(cfg["out_dir"], "best.pth"))
-                print(f"  -> new best RankMe={best_rankme:.3f} (saved best.pth)")
-            else:
+                print(f"  -> new best RankMe={best_rankme:.3f} @ epoch {epoch} (converged; saved best.pth)")
+            elif best_epoch >= 0:
+                # only count a RankMe plateau once we have a converged baseline to plateau from —
+                # pre-convergence evals are "not learned yet", not "improvement stalled".
                 no_improve += 1
 
             collapse_run = collapse_run + 1 if collapsed else 0
@@ -358,7 +403,13 @@ def main() -> None:
                 break
 
     if best_epoch >= 0:
-        print(f"[best] RankMe={best_rankme:.3f} @ epoch {best_epoch} -> {os.path.join(cfg['out_dir'], 'best.pth')}")
+        print(f"[best] converged, max-RankMe={best_rankme:.3f} @ epoch {best_epoch} "
+              f"-> {os.path.join(cfg['out_dir'], 'best.pth')}")
+    elif val_records:
+        print("[best] NO epoch passed the convergence gate "
+              f"(val_loss<={cfg.get('best_val_loss_max', -0.8)}, align<={cfg.get('best_align_max', 0.15)}); "
+              "best.pth was NOT written -> use last.pth for downstream, and check that training actually "
+              "converged (val_loss should approach -1).")
     if metrics_history:
         try:
             from braintumor_ssl.visualize import save_training_curves
@@ -367,6 +418,9 @@ def main() -> None:
             print(f"[plot] wrote {os.path.join(cfg['out_dir'], 'training_curves.png')}")
         except Exception as e:                       # plotting must never fail a training run
             print(f"[warn] training_curves.png not written: {e}")
+    tracker.log_artifact(os.path.join(cfg["out_dir"], "training_curves.png"), artifact_path="figures")
+    tracker.log_artifact(os.path.join(cfg["out_dir"], "metrics.csv"), artifact_path="tables")
+    tracker.close()
     print(f"[done] checkpoints in {cfg['out_dir']}")
 
 

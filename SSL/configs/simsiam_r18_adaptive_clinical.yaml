@@ -45,8 +45,10 @@ log_every: 10
 resume: null
 
 # ----- label-free validation monitoring (reference recipe: on) -----
-val_every: 1                     # validate + save best.pth by RankMe every epoch
+val_every: 1                     # validate + save best.pth every epoch
 min_delta_rankme: 0.05
+best_val_loss_max: -0.8          # best.pth convergence gate: eligible only if val_loss <= this ...
+best_align_max: 0.15             # ... AND alignment <= this (blocks the high-RankMe random-init epoch)
 early_stop: true                 # stop when RankMe plateaus for `patience` evals (after min_epochs)
 patience: 15
 min_epochs: 25
