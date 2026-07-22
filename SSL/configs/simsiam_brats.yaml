@@ -52,6 +52,17 @@ val_every: 10             # 0 = off; the reference recipe uses 1 (see simsiam_r1
 min_delta_rankme: 0.05    # min RankMe gain that counts as an improvement (best.pth / patience)
 best_val_loss_max: -0.8   # best.pth convergence gate: eligible only if val_loss <= this ...
 best_align_max: 0.15      # ... AND alignment <= this (RankMe peaks at random init; this blocks it)
+
+# ----- optional VICReg-style regularizer (off by default) -----
+# Adds variance + covariance terms on the projector embeddings to counter dimensional collapse
+# [Bardes2022]. 0 = pure SimSiam (unchanged). Turn on for the Stage-C ablation (see tasks/todo.md).
+vicreg_var: 0.0           # variance-hinge weight (typical VICReg: ~25 with the invariance term at 25)
+vicreg_cov: 0.0           # covariance weight (typical VICReg: ~1)
+vicreg_gamma: 1.0         # target per-dim std for the variance hinge
+# W-MSE whitening loss [Ermolov2021]; 0 = off. Needs proj_dim < batch_size for full-rank batch
+# whitening (with batch 16 -> use a small projector, e.g. proj_dim 8; see simsiam_densenet121_wmse.yaml).
+wmse_weight: 0.0
+wmse_eps: 1.0e-3          # shrinkage on the whitening covariance (Cholesky stability)
 early_stop: false         # stop once RankMe plateaus for `patience` evals (only after min_epochs)
 patience: 20
 min_epochs: 50

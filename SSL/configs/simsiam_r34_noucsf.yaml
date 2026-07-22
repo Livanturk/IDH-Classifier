@@ -1,0 +1,65 @@
+# Stage-A paper baseline [2/3]: resnet34 | adaptive-clinical WT recipe | PAPER split (UPENN in, UCSF out).
+# The three simsiam_{r18,r34,densenet121}_noucsf.yaml are IDENTICAL except `backbone` and `out_dir`,
+# so the backbone comparison is fair. Pure SimSiam (no VICReg / W-MSE) — this is the matched baseline
+# for the Stage-C rank-preservation ablations. Run with >=3 seeds via scripts/pretrain_stageA.sh;
+# the launcher overrides --seed and --out_dir per run.
+
+# ----- data -----
+data_root: BraTS2021/BraTS2021_TrainingSet
+splits_file: splits/splits_pretrain_noucsf.json   # PAPER split: UPENN included, UCSF-PDGM excluded (889 train / 99 val)
+modalities: [t1, t1ce, t2, flair]
+roi_size: [128, 128, 128]        # p95 WT cube (adaptive_crop.py)
+crop_mode: tumor                 # roi box centred on the WT centroid (seg used only to locate/mask the ROI)
+tumor_margin: 16
+center_mode: wt_centroid
+mask_out_non_tumor: true
+clip_percentiles: [0.5, 99.5]
+aug_preset: clinical
+normalize_after_crop: true
+num_workers: 12
+cache_rate: 0.0
+
+# ----- model -----
+backbone: resnet34               # <<< the ONLY axis that varies across the 3 baseline configs
+feature_dim: 256
+proj_dim: 256
+proj_hidden_dim: 512
+pred_hidden_dim: 128
+# pure SimSiam baseline: vicreg_var/cov = 0, wmse_weight = 0 (defaults) — Stage-C turns these on
+
+# ----- optimization -----
+optimizer: sgd
+base_lr: 0.05
+weight_decay: 1.0e-4
+momentum: 0.9
+epochs: 200
+batch_size: 16
+warmup_epochs: 10
+fix_pred_lr: true
+amp: true
+grad_clip: 1.0
+
+# ----- run (seed + out_dir overridden per run by the launcher) -----
+out_dir: checkpoints/simsiam_r34_noucsf
+seed: 42
+save_every: 20
+log_every: 10
+resume: null
+
+# ----- label-free validation monitoring -----
+val_every: 5
+min_delta_rankme: 0.05
+best_val_loss_max: -0.8
+best_align_max: 0.15
+early_stop: true
+patience: 15
+min_epochs: 50
+collapse_stop: true
+collapse_patience: 3
+z_std_min: 0.01
+rankme_min: 5.0
+pr_min: 5.0
+
+# ----- experiment tracking (MLflow -> DagsHub) -----
+mlflow: true
+mlflow_experiment: simsiam-brats-stageA

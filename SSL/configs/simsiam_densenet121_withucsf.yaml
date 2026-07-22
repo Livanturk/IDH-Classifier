@@ -1,0 +1,67 @@
+# Data-cohort ablation: densenet121 + UCSF-PDGM ADDED to pretraining.
+# Identical to configs/simsiam_densenet121_noucsf.yaml EXCEPT the split: here UCSF is added to the
+# TRAIN set (val is the SAME 99 non-UCSF subjects, so both encoders are judged on an identical
+# benchmark). Question: does the extra 263 UCSF subjects raise label-free representation quality
+# (RankMe/PR/uniformity) vs the noucsf baseline? Run on the winner backbone (densenet121).
+#
+# CROSS-PAPER NOTE: because UCSF images are seen in pretraining here, this encoder must NOT be used
+# for the future IDH paper's external-validation-on-UCSF claim — that role stays with the noucsf run.
+
+# ----- data -----
+data_root: BraTS2021/BraTS2021_TrainingSet
+splits_file: splits/splits_pretrain_withucsf.json   # noucsf train + UCSF added; val identical to noucsf
+modalities: [t1, t1ce, t2, flair]
+roi_size: [128, 128, 128]
+crop_mode: tumor
+tumor_margin: 16
+center_mode: wt_centroid
+mask_out_non_tumor: true
+clip_percentiles: [0.5, 99.5]
+aug_preset: clinical
+normalize_after_crop: true
+num_workers: 12
+cache_rate: 0.0
+
+# ----- model -----
+backbone: densenet121
+feature_dim: 256
+proj_dim: 256
+proj_hidden_dim: 512
+pred_hidden_dim: 128
+
+# ----- optimization -----
+optimizer: sgd
+base_lr: 0.05
+weight_decay: 1.0e-4
+momentum: 0.9
+epochs: 200
+batch_size: 16
+warmup_epochs: 10
+fix_pred_lr: true
+amp: true
+grad_clip: 1.0
+
+# ----- run (seed + out_dir overridden per run) -----
+out_dir: checkpoints/simsiam_densenet121_withucsf
+seed: 42
+save_every: 20
+log_every: 10
+resume: null
+
+# ----- label-free validation monitoring -----
+val_every: 5
+min_delta_rankme: 0.05
+best_val_loss_max: -0.8
+best_align_max: 0.15
+early_stop: true
+patience: 15
+min_epochs: 50
+collapse_stop: true
+collapse_patience: 3
+z_std_min: 0.01
+rankme_min: 5.0
+pr_min: 5.0
+
+# ----- experiment tracking -----
+mlflow: true
+mlflow_experiment: simsiam-brats-ablation

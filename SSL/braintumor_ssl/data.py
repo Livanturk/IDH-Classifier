@@ -270,15 +270,21 @@ class ClinicalTransform:
         noise_std: float = 0.03,
         scale_range: tuple[float, float] = (0.9, 1.1),
         shift_range: tuple[float, float] = (-0.1, 0.1),
+        strength: float = 1.0,
     ):
+        # `strength` scales the intensity-augmentation MAGNITUDES around their centres (noise std,
+        # scale deviation, shift range); strength=1.0 leaves the reference recipe unchanged. It is
+        # the config-driven "strong aug" knob for the Stage-C ablation (tasks/todo.md A0.4). Probs
+        # and flips are left as-is so the ablation isolates distortion magnitude, not frequency.
         self.flip_prob = flip_prob
         self.scale_prob = scale_prob
         self.shift_prob = shift_prob
         self.noise_prob = noise_prob
         self.blur_prob = blur_prob
-        self.noise_std = noise_std
-        self.scale_range = scale_range
-        self.shift_range = shift_range
+        self.noise_std = noise_std * strength
+        self.scale_range = (1.0 - (1.0 - scale_range[0]) * strength,
+                            1.0 + (scale_range[1] - 1.0) * strength)
+        self.shift_range = (shift_range[0] * strength, shift_range[1] * strength)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         x = torch.as_tensor(x).float().clone()
@@ -301,7 +307,7 @@ class ClinicalTransform:
         return torch.where(nonzero, x, torch.zeros_like(x))  # guarantee the background stays 0
 
 
-def make_appearance_transforms(roi_size, preset: str = "standard"):
+def make_appearance_transforms(roi_size, preset: str = "standard", aug_strength: float = 1.0):
     """Appearance/geometry augmentations applied AFTER the spatial crop (per view).
 
     preset:
@@ -313,7 +319,7 @@ def make_appearance_transforms(roi_size, preset: str = "standard"):
                      WT-masked ROI's zero background exact. This is the reference-recipe preset.
     """
     if preset == "clinical":
-        return ClinicalTransform()
+        return ClinicalTransform(strength=aug_strength)
     if preset == "gentle":
         return Compose(
             [
@@ -364,6 +370,7 @@ class BraTSViews(Dataset):
         mask_out_non_tumor: bool = False, # zero out non-tumour voxels inside the crop
         clip_percentiles=(0.5, 99.5),     # foreground intensity clip before z-score
         aug_preset: str = "auto",         # standard | gentle | auto (gentle if masked)
+        aug_strength: float = 1.0,        # scales clinical intensity-aug magnitude (Stage-C A0.4)
         normalize_after_crop: bool = False,  # normalize on the (masked) ROI, not the whole brain
         cache: bool = False,
     ):
@@ -385,7 +392,7 @@ class BraTSViews(Dataset):
         # 'auto' -> gentle geometry for masked/tumour-only ROIs, standard otherwise
         preset = ("gentle" if self.mask_out else "standard") if aug_preset == "auto" else aug_preset
         self.aug_preset = preset
-        self.appearance = make_appearance_transforms(roi_size, preset)
+        self.appearance = make_appearance_transforms(roi_size, preset, float(aug_strength))
         self._cache: dict[int, tuple] = {} if cache else None
 
     def __len__(self) -> int:
@@ -445,6 +452,7 @@ def make_views(records: list[dict], cfg: dict, mode: str, cache: bool = False) -
         mask_out_non_tumor=cfg.get("mask_out_non_tumor", False),
         clip_percentiles=cfg.get("clip_percentiles", (0.5, 99.5)),
         aug_preset=cfg.get("aug_preset", "auto"),
+        aug_strength=cfg.get("aug_strength", 1.0),
         normalize_after_crop=cfg.get("normalize_after_crop", False),
         cache=cache,
     )

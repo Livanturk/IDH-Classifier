@@ -122,3 +122,58 @@ def simsiam_loss(out: dict[str, torch.Tensor]) -> torch.Tensor:
         return -(p * z).sum(dim=1).mean()
 
     return 0.5 * d(out["p1"], out["z2"]) + 0.5 * d(out["p2"], out["z1"])
+
+
+def vc_regularizer(out: dict[str, torch.Tensor], gamma: float = 1.0,
+                   eps: float = 1e-4) -> tuple[torch.Tensor, torch.Tensor]:
+    """VICReg variance + covariance terms on the projector embeddings z1, z2 [Bardes2022].
+
+    Optional add-on to `simsiam_loss` (which already supplies the invariance term via the
+    predictor + stop-gradient). SimSiam has no explicit rank-preserving term, so it is prone to
+    *dimensional collapse* [Jing2022]; these two terms counter it directly:
+      - variance : hinge that keeps each embedding dim's std >= gamma across the batch, so no
+                   dimension is allowed to shrink to a constant;
+      - covariance: pushes off-diagonal feature covariances to zero, decorrelating the dimensions
+                   so variance is spread over the full space rather than a few directions.
+    Returns (var_term, cov_term) separately so the trainer can weight and log each. Computed in
+    float32 for numerical stability under AMP. Not applied when its weights are 0 (default off)."""
+    def _vc(z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        z = z.float()
+        z = z - z.mean(dim=0)
+        std = torch.sqrt(z.var(dim=0) + eps)
+        var = torch.mean(F.relu(gamma - std))
+        n, d = z.shape
+        cov = (z.T @ z) / (n - 1)
+        cov_off = cov.pow(2).sum() - cov.pow(2).diagonal().sum()
+        return var, cov_off / d
+
+    v1, c1 = _vc(out["z1"])
+    v2, c2 = _vc(out["z2"])
+    return 0.5 * (v1 + v2), 0.5 * (c1 + c2)
+
+
+def whitening_mse_loss(out: dict[str, torch.Tensor], eps: float = 1e-3) -> torch.Tensor:
+    """W-MSE-style whitening loss on the projector embeddings z1, z2 [Ermolov2021].
+
+    Whitens each view's batch (ZCA via Cholesky of the shrinkage-regularised covariance) so the
+    embedding batch has ~identity covariance, then matches the two whitened views (negative cosine,
+    same scale as simsiam_loss). Anti-collapse is IMPLICIT: a collapsed batch has a singular
+    covariance and cannot be whitened, so the objective is driven away from collapse — a different
+    mechanism from VICReg's soft penalty.
+
+    IMPORTANT: full-rank batch whitening needs (batch size) > (embedding dim). With the 3D memory
+    budget (batch 16) this forces a SMALL projector (proj_dim < batch) for the whitening to be
+    meaningful — small projections are how W-MSE is designed to run, but our batch cap makes the
+    projector unusually tight; this constraint is itself a finding for the 3D small-batch regime.
+    Computed in float32 for Cholesky stability under AMP. Optional add-on; off by default."""
+    def whiten(z: torch.Tensor) -> torch.Tensor:
+        z = z.float()
+        z = z - z.mean(0, keepdim=True)
+        n, d = z.shape
+        cov = (z.T @ z) / (n - 1) + eps * torch.eye(d, device=z.device, dtype=z.dtype)
+        L = torch.linalg.cholesky(cov)
+        return torch.linalg.solve_triangular(L, z.T, upper=False).T   # z @ (L^{-1})^T
+
+    z1w = F.normalize(whiten(out["z1"]), dim=1)
+    z2w = F.normalize(whiten(out["z2"]), dim=1)
+    return -0.5 * ((z1w * z2w).sum(1).mean() + (z2w * z1w).sum(1).mean())

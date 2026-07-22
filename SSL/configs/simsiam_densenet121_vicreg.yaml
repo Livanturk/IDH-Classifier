@@ -1,0 +1,71 @@
+# Stage-C ablation: densenet121 + VICReg-style variance/covariance regularizer.
+# Identical to the densenet121 baseline EXCEPT (a) the paper split (UPENN in, UCSF out) and
+# (b) the vicreg_* weights are non-zero. Purpose: does an explicit rank-preserving term mitigate
+# the dimensional collapse we observed in pure SimSiam (RankMe 16->6 over training)? [Bardes2022]
+# NOTE: vicreg_var/cov below are the SWEEP CENTRE — Stage C.2 sweeps them (see tasks/todo.md); the
+# SimSiam loss here is cosine-scaled (|L|~1), not MSE, so VICReg's original 25:25:1 weights don't
+# transfer directly. The matched baseline is this file with vicreg_var=vicreg_cov=0 (Stage C.1).
+
+# ----- data -----
+data_root: BraTS2021/BraTS2021_TrainingSet
+splits_file: splits/splits_pretrain_noucsf.json   # PAPER split: UPENN included, UCSF-PDGM excluded (889 train / 99 val)
+modalities: [t1, t1ce, t2, flair]
+roi_size: [128, 128, 128]
+crop_mode: tumor
+tumor_margin: 16
+center_mode: wt_centroid
+mask_out_non_tumor: true
+clip_percentiles: [0.5, 99.5]
+aug_preset: clinical
+normalize_after_crop: true
+num_workers: 12
+cache_rate: 0.0
+
+# ----- model -----
+backbone: densenet121
+feature_dim: 256
+proj_dim: 256
+proj_hidden_dim: 512
+pred_hidden_dim: 128
+
+# ----- optimization -----
+optimizer: sgd
+base_lr: 0.05
+weight_decay: 1.0e-4
+momentum: 0.9
+epochs: 200
+batch_size: 16
+warmup_epochs: 10
+fix_pred_lr: true
+amp: true
+grad_clip: 1.0
+
+# ----- VICReg VC-regularizer (THIS is what differs from the Stage-C.1 baseline) -----
+vicreg_var: 1.0                  # sweep centre; Stage C.2 grid, e.g. {0.25, 1, 4}
+vicreg_cov: 0.04                 # sweep centre (keeps VICReg's ~25:1 var:cov ratio)
+vicreg_gamma: 1.0
+
+# ----- run -----
+out_dir: checkpoints/simsiam_densenet121_vicreg
+seed: 42
+save_every: 20
+log_every: 10
+resume: null
+
+# ----- label-free validation monitoring -----
+val_every: 5
+min_delta_rankme: 0.05
+best_val_loss_max: -0.8
+best_align_max: 0.15
+early_stop: true
+patience: 15
+min_epochs: 50
+collapse_stop: true
+collapse_patience: 3
+z_std_min: 0.01
+rankme_min: 5.0
+pr_min: 5.0
+
+# ----- experiment tracking (MLflow -> DagsHub) -----
+mlflow: true
+mlflow_experiment: simsiam-brats-vicreg

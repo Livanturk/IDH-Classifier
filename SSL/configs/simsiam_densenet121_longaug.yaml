@@ -1,0 +1,66 @@
+# Stage-C ablation (A0.4): densenet121 + LONGER training + STRONGER augmentation.
+# Identical to the densenet121 paper baseline EXCEPT epochs (2x) and aug_strength (2x). Rationale:
+# dimensional collapse sets in early (~epoch 14) and stabilises; more epochs alone may not help
+# (or may deepen collapse), but stronger augmentation increases the invariance pressure that
+# spreads representation over more directions [WangIsola2020]. This axis tests both together.
+# Matched baseline = the densenet121 run on splits_pretrain_noucsf (200 ep, aug_strength 1.0).
+
+# ----- data -----
+data_root: BraTS2021/BraTS2021_TrainingSet
+splits_file: splits/splits_pretrain_noucsf.json   # PAPER split: UPENN in, UCSF-PDGM out (889 train / 99 val)
+modalities: [t1, t1ce, t2, flair]
+roi_size: [128, 128, 128]
+crop_mode: tumor
+tumor_margin: 16
+center_mode: wt_centroid
+mask_out_non_tumor: true
+clip_percentiles: [0.5, 99.5]
+aug_preset: clinical
+aug_strength: 2.0                # THIS differs: 2x the clinical intensity-aug magnitude (noise/scale/shift)
+normalize_after_crop: true
+num_workers: 12
+cache_rate: 0.0
+
+# ----- model -----
+backbone: densenet121
+feature_dim: 256
+proj_dim: 256
+proj_hidden_dim: 512
+pred_hidden_dim: 128
+
+# ----- optimization (THIS differs: 2x epochs + warmup) -----
+optimizer: sgd
+base_lr: 0.05
+weight_decay: 1.0e-4
+momentum: 0.9
+epochs: 400                      # baseline 200 -> longer training
+batch_size: 16
+warmup_epochs: 20                # baseline 10  -> scaled with the longer schedule
+fix_pred_lr: true
+amp: true
+grad_clip: 1.0
+
+# ----- run -----
+out_dir: checkpoints/simsiam_densenet121_longaug
+seed: 42
+save_every: 20
+log_every: 10
+resume: null
+
+# ----- label-free validation monitoring -----
+val_every: 5
+min_delta_rankme: 0.05
+best_val_loss_max: -0.8
+best_align_max: 0.15
+early_stop: true                 # plateau early-stop still applies (won't force all 400 epochs if converged)
+patience: 15
+min_epochs: 50
+collapse_stop: true
+collapse_patience: 3
+z_std_min: 0.01
+rankme_min: 5.0
+pr_min: 5.0
+
+# ----- experiment tracking -----
+mlflow: true
+mlflow_experiment: simsiam-brats-ablation

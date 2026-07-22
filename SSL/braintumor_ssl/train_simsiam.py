@@ -21,7 +21,7 @@ import yaml
 from torch.utils.data import DataLoader
 
 from braintumor_ssl.data import load_splits, make_views
-from braintumor_ssl.models import SimSiam, simsiam_loss
+from braintumor_ssl.models import SimSiam, simsiam_loss, vc_regularizer, whitening_mse_loss
 from braintumor_ssl.tracking import Tracker
 from braintumor_ssl.utils import (
     AverageMeter,
@@ -53,7 +53,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--tumor_margin", type=int)
     ap.add_argument("--center_mode", choices=["wt_centroid", "bbox_center"])
     ap.add_argument("--mask_out_non_tumor", action="store_true", default=None)
-    ap.add_argument("--aug_preset", choices=["standard", "gentle", "auto"])
+    ap.add_argument("--aug_preset", choices=["standard", "gentle", "clinical", "auto"])
     ap.add_argument("--normalize_after_crop", action="store_true", default=None)
     ap.add_argument("--num_workers", type=int)
     ap.add_argument("--backbone")
@@ -83,6 +83,13 @@ def parse_args() -> argparse.Namespace:
                     help="epoch eligible for best.pth only if val_loss <= this (default -0.8)")
     ap.add_argument("--best_align_max", type=float,
                     help="and alignment <= this (default 0.15); blocks the high-RankMe random-init epoch")
+    # optional VICReg-style variance/covariance regularizer (0 = off; counters dimensional collapse)
+    ap.add_argument("--vicreg_var", type=float, help="variance-term weight (0=off)")
+    ap.add_argument("--vicreg_cov", type=float, help="covariance-term weight (0=off)")
+    ap.add_argument("--vicreg_gamma", type=float, help="target per-dim std for the variance hinge (default 1.0)")
+    ap.add_argument("--aug_strength", type=float, help="scale clinical intensity-aug magnitude (default 1.0)")
+    ap.add_argument("--wmse_weight", type=float, help="W-MSE whitening-loss weight (0=off; needs proj_dim<batch)")
+    ap.add_argument("--wmse_eps", type=float, help="shrinkage for the whitening covariance (default 1e-3)")
     ap.add_argument("--early_stop", action="store_true", default=None)
     ap.add_argument("--patience", type=int)
     ap.add_argument("--min_epochs", type=int)
@@ -307,10 +314,25 @@ def main() -> None:
     tracker.log_dict(cfg, "config/resolved_config.json")
     tracker.log_artifact(args.config, artifact_path="config")
 
+    # optional VICReg-style variance/covariance regularizer on the projector embeddings
+    # (off by default; counters dimensional collapse — see models.vc_regularizer / MODEL_SELECTION)
+    w_var, w_cov = float(cfg.get("vicreg_var", 0.0) or 0.0), float(cfg.get("vicreg_cov", 0.0) or 0.0)
+    vic_on = w_var > 0.0 or w_cov > 0.0
+    if vic_on:
+        print(f"[reg] VICReg VC-reg ON: var_w={w_var} cov_w={w_cov} gamma={cfg.get('vicreg_gamma', 1.0)}")
+    w_wmse = float(cfg.get("wmse_weight", 0.0) or 0.0)
+    wmse_on = w_wmse > 0.0
+    if wmse_on:
+        if cfg["proj_dim"] >= cfg["batch_size"]:
+            print(f"[reg][warn] W-MSE needs proj_dim < batch_size for full-rank whitening "
+                  f"(proj_dim={cfg['proj_dim']}, batch={cfg['batch_size']}); whitening will be rank-deficient")
+        print(f"[reg] W-MSE whitening ON: weight={w_wmse} eps={cfg.get('wmse_eps', 1e-3)}")
+
     # ---- train ----
     for epoch in range(start_epoch, cfg["epochs"]):
         model.train()
         loss_m, std_m = AverageMeter(), AverageMeter()
+        var_m, cov_m, wmse_m = AverageMeter(), AverageMeter(), AverageMeter()
         t0 = time.time()
         for it, batch in enumerate(train_ld):
             if cfg["smoke"] and it >= 3:
@@ -326,6 +348,15 @@ def main() -> None:
             with torch.amp.autocast("cuda", enabled=use_amp):
                 out = model(x1, x2)
                 loss = simsiam_loss(out)
+                if vic_on:
+                    var_t, cov_t = vc_regularizer(out, float(cfg.get("vicreg_gamma", 1.0)))
+                    loss = loss + w_var * var_t + w_cov * cov_t
+                    var_m.update(float(var_t), x1.size(0))
+                    cov_m.update(float(cov_t), x1.size(0))
+                if wmse_on:
+                    wmse_t = whitening_mse_loss(out, float(cfg.get("wmse_eps", 1e-3)))
+                    loss = loss + w_wmse * wmse_t
+                    wmse_m.update(float(wmse_t), x1.size(0))
             scaler.scale(loss).backward()
             if cfg.get("grad_clip"):
                 scaler.unscale_(optimizer)
@@ -340,10 +371,17 @@ def main() -> None:
                       f"loss={loss_m.avg:+.4f} z_std={std_m.avg:.4f}")
 
         expected = 1.0 / (cfg["feature_dim"] ** 0.5)
-        print(f"[epoch {epoch:03d}] loss={loss_m.avg:+.4f} z_std={std_m.avg:.4f} "
+        vic_str = f" var={var_m.avg:.4f} cov={cov_m.avg:.4f}" if vic_on else ""
+        vic_str += f" wmse={wmse_m.avg:+.4f}" if wmse_on else ""
+        print(f"[epoch {epoch:03d}] loss={loss_m.avg:+.4f} z_std={std_m.avg:.4f}{vic_str} "
               f"(healthy~{expected:.4f}) time={time.time()-t0:.1f}s")
-        tracker.log_metrics({"train_loss": loss_m.avg, "train_z_std": std_m.avg,
-                             "lr": optimizer.param_groups[0]["lr"]}, step=epoch)
+        train_metrics = {"train_loss": loss_m.avg, "train_z_std": std_m.avg,
+                         "lr": optimizer.param_groups[0]["lr"]}
+        if vic_on:
+            train_metrics.update(train_vic_var=var_m.avg, train_vic_cov=cov_m.avg)
+        if wmse_on:
+            train_metrics.update(train_wmse=wmse_m.avg)
+        tracker.log_metrics(train_metrics, step=epoch)
 
         is_last = epoch == cfg["epochs"] - 1
         if is_last or (epoch + 1) % cfg["save_every"] == 0:
@@ -376,7 +414,8 @@ def main() -> None:
             write_metrics_csv(os.path.join(cfg["out_dir"], "metrics.csv"), metrics_history)
             tracker.log_metrics({"val_loss": vm["val_loss"], "z_std": vm["z_std"], "rankme": vm["rankme"],
                                  "participation_ratio": vm["participation_ratio"],
-                                 "alignment": vm["alignment"], "uniformity": vm["uniformity"]}, step=epoch)
+                                 "alignment": vm["alignment"], "uniformity": vm["uniformity"],
+                                 "converged": float(converged), "collapsed": float(collapsed)}, step=epoch)
 
             # best.pth = highest RankMe *among converged, non-collapsed* epochs. The convergence
             # gate is what stops best.pth from latching onto the high-RankMe random-init epoch.
@@ -405,6 +444,8 @@ def main() -> None:
     if best_epoch >= 0:
         print(f"[best] converged, max-RankMe={best_rankme:.3f} @ epoch {best_epoch} "
               f"-> {os.path.join(cfg['out_dir'], 'best.pth')}")
+        # record the selection outcome so DagsHub shows which epoch each run's best.pth came from
+        tracker.log_metrics({"best_epoch": float(best_epoch), "best_rankme": best_rankme})
     elif val_records:
         print("[best] NO epoch passed the convergence gate "
               f"(val_loss<={cfg.get('best_val_loss_max', -0.8)}, align<={cfg.get('best_align_max', 0.15)}); "

@@ -35,6 +35,7 @@ from braintumor_ssl.data import load_splits, make_views, scan_subjects
 from braintumor_ssl.models import SimSiam
 from braintumor_ssl.utils import (
     alignment,
+    jackknife_ci,
     participation_ratio,
     rankme,
     recompute_bn_stats,
@@ -58,6 +59,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--batch_size", type=int, default=8)
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--no_ci", action="store_true",
+                    help="skip the jackknife 95%% CI on rankme/PR/uniformity (faster)")
     ap.add_argument("--mlflow", action="store_true", help="log leaderboard + figures to MLflow/DagsHub")
     ap.add_argument("--mlflow_experiment", default="simsiam-brats-eval")
     return ap.parse_args()
@@ -188,8 +191,17 @@ def main() -> None:
             "uniformity": round(uniformity(H1), 4),             # want NEGATIVE
             "particip_ratio": round(participation_ratio(H1), 2),  # want HIGH
         }
+        # jackknife 95% CIs over subjects for the ranking/tie-break metrics (D2 uses rankme CI)
+        if not args.no_ci:
+            rl, rh = jackknife_ci(rankme, H1)
+            pl, ph = jackknife_ci(participation_ratio, H1)
+            ul, uh = jackknife_ci(uniformity, H1)
+            row.update(rankme_ci_lo=round(rl, 2), rankme_ci_hi=round(rh, 2),
+                       pr_ci_lo=round(pl, 2), pr_ci_hi=round(ph, 2),
+                       unif_ci_lo=round(ul, 4), unif_ci_hi=round(uh, 4))
         rows.append(row)
-        print(f"  {name:24s} rankme={row['rankme']:6.2f} align={row['alignment']:.4f} "
+        ci = f" [{row['rankme_ci_lo']:.2f},{row['rankme_ci_hi']:.2f}]" if not args.no_ci else ""
+        print(f"  {name:24s} rankme={row['rankme']:6.2f}{ci} align={row['alignment']:.4f} "
               f"unif={row['uniformity']:+.3f} pr={row['particip_ratio']:6.2f} z_std={row['z_std']:.4f}")
 
         # persist per-config features + optional 2-D embedding
@@ -220,6 +232,7 @@ def main() -> None:
 
         result_dir = os.path.dirname(args.out) or "."
         metric_keys = ("z_std", "rankme", "alignment", "uniformity", "particip_ratio")
+        ci_keys = ("rankme_ci_lo", "rankme_ci_hi", "pr_ci_lo", "pr_ci_hi", "unif_ci_lo", "unif_ci_hi")
         # One MLflow run per checkpoint makes DagsHub's run comparison view useful.
         for row in rows:
             tk = Tracker(
@@ -227,8 +240,10 @@ def main() -> None:
                 run_name=f"evaluate-{row['config']}",
                 tags={"stage": "evaluation", "backbone": row["backbone"]},
             )
-            tk.log_params({k: v for k, v in row.items() if k not in metric_keys})
+            tk.log_params({k: v for k, v in row.items() if k not in metric_keys and k not in ci_keys})
             tk.log_metrics({k: row[k] for k in metric_keys}, step=int(row["epoch"]))
+            # jackknife CIs are numeric — log as metrics (not params) so DagsHub shows them with rankme
+            tk.log_metrics({k: row[k] for k in ci_keys if k in row}, step=int(row["epoch"]))
             tk.log_artifact(args.out, artifact_path="tables")
             tk.log_artifact(os.path.join(result_dir, f"{row['config']}_{args.embed}.png"),
                             artifact_path="figures")

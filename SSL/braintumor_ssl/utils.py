@@ -192,3 +192,42 @@ def participation_ratio(Z: torch.Tensor) -> float:
     z = Z.float() - Z.float().mean(0, keepdim=True)
     ev = _svdvals(z).pow(2)
     return float((ev.sum() ** 2) / (ev.pow(2).sum() + 1e-12))
+
+
+def jackknife_ci(metric_fn, *tensors: torch.Tensor,
+                 alpha: float = 0.05) -> tuple[float, float]:
+    """Jackknife (leave-one-out) confidence interval for a label-free metric over subjects.
+
+    Why not the ordinary bootstrap: resampling subjects WITH replacement duplicates rows, and
+    duplicate rows are linearly dependent — they shrink the feature matrix's effective rank. So a
+    naive bootstrap biases RankMe / participation-ratio (and, via the spectrum, uniformity)
+    systematically DOWNWARD; its interval can fail to even contain the point estimate. The
+    jackknife leaves one subject out at a time, so every subset has distinct rows and the rank
+    statistic is not corrupted. RankMe/PR/uniformity/alignment are smooth functionals of the data
+    (unlike the median, where the jackknife is inconsistent), so the jackknife is valid here, and
+    it is deterministic — a reproducibility bonus for the paper.
+
+    Returns a normal-approximation interval  θ ± z·SE_jack  (z=1.96 at 95%), where
+    SE_jack = sqrt((n-1)/n · Σ(θ_(i) − θ̄)²). Paired tensors (two views for alignment) drop the
+    SAME subject each fold so pairing is preserved. [Efron&Tibshirani1993]"""
+    n = tensors[0].shape[0]
+    theta_full = float(metric_fn(*tensors))
+    keep = torch.ones(n, dtype=torch.bool)
+    loo = []
+    for i in range(n):
+        keep[i] = False
+        loo.append(float(metric_fn(*[t[keep] for t in tensors])))
+        keep[i] = True
+    loo_t = torch.tensor(loo)
+    se = math.sqrt((n - 1) / n * float(((loo_t - loo_t.mean()) ** 2).sum()))
+    z = 1.959963984540054 if abs(alpha - 0.05) < 1e-9 else _z_for_alpha(alpha)
+    return theta_full - z * se, theta_full + z * se
+
+
+def _z_for_alpha(alpha: float) -> float:
+    """Two-sided normal quantile for (1-alpha) coverage, via inverse-erf (no SciPy dependency)."""
+    return math.sqrt(2.0) * _erfinv(1.0 - alpha)
+
+
+def _erfinv(y: float) -> float:
+    return float(torch.erfinv(torch.tensor(y, dtype=torch.float64)))
