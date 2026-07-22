@@ -87,11 +87,12 @@ En iyi backbone üzerinde, hepsi çok-seed + GA. Ölçüt: **RankMe yörüngesi 
 - [ ] **D.1** densenet121: `crop_mode=tumor` (adaptive-clinical) **vs** `crop_mode=brain`. Recipe'yi
       gerekçelendirir. (CLAUDE.md ablasyon merdiveni ile uyumlu.)
 - [ ] **D.2** (ops.) ROI 128³ vs 96³/112³ — hesap/kalite ödünleşmesi (adaptive_crop kapsama tablosu).
-- [x] **D.3 veri-kohort split HAZIR:** `splits_pretrain_withucsf.json` üretildi+doğrulandı (train=1152 =
-      noucsf 889 + UCSF 263, val=99 noucsf ile BİREBİR aynı, val'da UCSF=0). config `simsiam_densenet121_withucsf.yaml`.
-- [ ] **D.3 runs:** densenet ×3 seed koş (`--config configs/simsiam_densenet121_withucsf.yaml`), sonra
-      densenet-noucsf vs densenet-withucsf karşılaştır (aynı val=99 → "UCSF eklemek RankMe'yi artırıyor mu?").
-      Çapraz-makale: withucsf encoder harici-test için kullanılamaz (L12).
+- [x] **D.3 veri-kohort HAZIR:** split `splits_pretrain_withucsf.json` (train=1152 = noucsf 889 + UCSF 263,
+      val=99 noucsf ile BİREBİR aynı). **3 backbone** config'i: `simsiam_{r18,r34,densenet121}_withucsf.yaml`.
+      Launcher `VARIANT` ile genelleştirildi (noucsf/withucsf aynı iki-node mantığı). Doğrulandı.
+- [ ] **D.3 runs:** `NODE=ai02 VARIANT=withucsf bash ...` + `NODE=ai01 VARIANT=withucsf bash ...` →
+      `COMPARE=1 VARIANT=withucsf bash ...`. Sonra noucsf vs withucsf'i karşılaştır (aynı val=99 → "UCSF
+      eklemek RankMe'yi artırıyor mu?"). Çapraz-makale: withucsf encoder harici-test için kullanılamaz (L12).
 
 ## Aşama E — Yazım / gerekçelendirme
 
