@@ -417,8 +417,12 @@ def main() -> None:
                                  "alignment": vm["alignment"], "uniformity": vm["uniformity"],
                                  "converged": float(converged), "collapsed": float(collapsed)}, step=epoch)
 
-            # best.pth = highest RankMe *among converged, non-collapsed* epochs. The convergence
-            # gate is what stops best.pth from latching onto the high-RankMe random-init epoch.
+            # best.pth = highest RankMe *among converged, non-collapsed* epochs = the "max retained
+            # rank" checkpoint. The convergence gate stops it latching onto the random-init epoch.
+            # NOTE (L13): this rule = the earliest-converged epoch and its RankMe VALUE is volatile
+            # (steep transient x seed-dependent convergence timing); it is NOT the backbone-comparison
+            # basis. The comparison uses the final/plateau checkpoint (last.pth, always saved below);
+            # best.pth is kept as the high-rank option whose downstream value D3 (labels) will judge.
             eligible = converged and (not collapsed) and math.isfinite(vm["rankme"])
             improved = eligible and vm["rankme"] > best_rankme + cfg.get("min_delta_rankme", 0.0)
             if improved:

@@ -1,0 +1,65 @@
+# Paper baseline [2/3]: resnet34 | adaptive-clinical WT recipe | UNIFIED all-data cohort.
+# The three simsiam_{r18,r34,densenet121}_unified.yaml are IDENTICAL except `backbone` and `out_dir`.
+# Cohort = BraTS-others (585) + external UCSF-PDGM (501) + external UPENN-GBM (610) = 1696 subjects
+# (data_unified symlinks; scripts/build_unified_dataset.py). Single cohort — no noucsf/withucsf split
+# (see lessons L14). External sets are 8-bit; z-score + augmentation harmonize scale (documented).
+# Pure SimSiam (no VICReg/W-MSE). Comparison basis = final/plateau checkpoint (L13); run >=3 seeds.
+
+# ----- data -----
+data_root: data_unified
+splits_file: splits/splits_pretrain_all.json   # 1696 subjects (1526 train / 170 val)
+modalities: [t1, t1ce, t2, flair]
+roi_size: [128, 128, 128]
+crop_mode: tumor
+tumor_margin: 16
+center_mode: wt_centroid
+mask_out_non_tumor: true
+clip_percentiles: [0.5, 99.5]
+aug_preset: clinical
+normalize_after_crop: true
+num_workers: 4  # 4 simultaneous GPU jobs share gzip-compressed NIfTI files on NFS; avoid I/O bursts
+cache_rate: 0.0
+
+# ----- model -----
+backbone: resnet34               # <<< the ONLY axis that varies across the 3 baseline configs
+feature_dim: 256
+proj_dim: 256
+proj_hidden_dim: 512
+pred_hidden_dim: 128
+
+# ----- optimization -----
+optimizer: sgd
+base_lr: 0.05
+weight_decay: 1.0e-4
+momentum: 0.9
+epochs: 200
+batch_size: 16
+warmup_epochs: 10
+fix_pred_lr: true
+amp: true
+grad_clip: 1.0
+
+# ----- run (seed + out_dir overridden per run by the launcher) -----
+out_dir: checkpoints/simsiam_r34_unified
+seed: 42
+save_every: 20
+log_every: 10
+resume: null
+
+# ----- label-free validation monitoring -----
+val_every: 5
+min_delta_rankme: 0.05
+best_val_loss_max: -0.8
+best_align_max: 0.15
+early_stop: true
+patience: 15
+min_epochs: 50
+collapse_stop: true
+collapse_patience: 3
+z_std_min: 0.01
+rankme_min: 5.0
+pr_min: 5.0
+
+# ----- experiment tracking (MLflow -> DagsHub) -----
+mlflow: true
+mlflow_experiment: simsiam-brats-all

@@ -5,8 +5,13 @@ weighted sum) so the winner is defensible in the paper.
 
     1. Eligibility gate : finite metrics ∧ z_std ≥ z_std_min ∧ alignment ≤ align_max
                           (a run that collapsed or never converged is disqualified)
-    2. Representative   : per config, the eligible checkpoint with the highest RankMe
-                          (mirrors D1; leaderboards with several epochs collapse to one row/run)
+    2. Representative   : per config, the FINAL (plateau) checkpoint — `--select latest` (default).
+                          The multi-seed analysis showed that ranking by max-RankMe-among-converged
+                          (`--select best-converged`, the "R1" rule) samples a steep transient at a
+                          seed-dependent convergence epoch, so its value is volatile (CV up to ~24%)
+                          and it fails to separate backbones; the final plateau checkpoint is stable
+                          (CV ~8%) and reproducible. `best-converged` is kept only as the R1 ablation
+                          that demonstrates that instability. (See MODEL_SELECTION.md §D1 / lessons L13.)
     3. Primary key      : RankMe ↓  [Garrido2023]
     4. Uncertainty rule : two runs tie if their RankMe are within `delta` — or, when the
                           leaderboard carries CI columns (rankme_ci_lo/rankme_ci_hi), if those
@@ -66,14 +71,16 @@ def eligible(r: dict, z_std_min: float, align_max: float) -> tuple[bool, str]:
 
 
 def representative(rows: list[dict], policy: str, z_std_min: float, align_max: float) -> dict | None:
-    """Pick the row that represents this run: best-converged (default), latest, or a fixed epoch."""
+    """Pick the row that represents this run: latest=final plateau checkpoint (default, stable),
+    a fixed epoch, or best-converged=R1 ablation (max-RankMe among converged — volatile)."""
     if policy == "latest":
         return max(rows, key=lambda r: r["epoch"])
     if policy.startswith("epoch:"):
         want = float(policy.split(":", 1)[1])
         cand = [r for r in rows if r["epoch"] == want]
         return cand[0] if cand else None
-    # default: highest RankMe among the eligible (converged, non-collapsed) checkpoints
+    # R1 ablation: highest RankMe among the eligible (converged, non-collapsed) checkpoints —
+    # kept to demonstrate its instability, NOT the recommended comparison basis (see docstring).
     elig = [r for r in rows if eligible(r, z_std_min, align_max)[0]]
     return max(elig, key=lambda r: r["rankme"]) if elig else None
 
@@ -207,8 +214,10 @@ def main() -> None:
     ap.add_argument("--align_max", type=float, default=ALIGN_MAX)
     ap.add_argument("--delta", type=float, default=DELTA_RANKME,
                     help="RankMe tie margin (ignored when CI columns / multiple seeds give a CI)")
-    ap.add_argument("--select", default="best-converged",
-                    choices=["best-converged", "latest"], help="or 'epoch:N'")
+    ap.add_argument("--select", default="latest",
+                    choices=["latest", "best-converged"],
+                    help="latest=final plateau checkpoint (RECOMMENDED, stable/reproducible); "
+                         "best-converged=R1 ablation (max-RankMe among converged — volatile); or 'epoch:N'")
     ap.add_argument("--select_epoch", type=int, help="shortcut for --select epoch:N")
     ap.add_argument("--group_by", default="backbone", choices=["backbone", "config"],
                     help="'backbone' aggregates seeds (across-seed CI); 'config' keeps per-run")

@@ -88,27 +88,39 @@ yakınsamış best bulunduktan sonra** artar. Böylece "henüz öğrenmedi" duru
 
 ## 3. Seçim algoritması (üç kademe)
 
-### D1 — Run-içi checkpoint seçimi (hangi epoch → best.pth)
+### D1 — Run-içi checkpoint seçimi (hangi checkpoint karşılaştırmaya girer)
+
+**KARŞILAŞTIRMA TEMELİ = final (plato) checkpoint (last.pth).** Çok-seed analizi (18 koşu, L13)
+şunu gösterdi: "yakınsamışlar arasında max-RankMe" kuralı (aşağıdaki *R1*) her zaman **ilk-yakınsayan
+epoch**'u seçer, çünkü RankMe yakınsamada zirve yapıp düşer. O zirve dik bir geçiştir; her-5-epoch
+ızgarasıyla, seed'e göre kayan bir yakınsama anında örneklendiğinden değeri **oynaktır** (CV ~%15–24)
+ve backbone'ları ayıramaz. Final plato checkpoint'i ise **kararlı** (CV ~%8), ızgaradan ve
+seed-zamanlamasından bağımsız, tekrarlanabilir → adil karşılaştırmanın temeli budur.
 
 ```
-eligible(e)  ⟺  finite(m_e) ∧ z_std_e ≥ z_std_min ∧ L_val_e ≤ best_val_loss_max ∧ A_e ≤ best_align_max
-best.pth = argmax_{e : eligible(e)} RankMe_e
-   eşitlik (|ΔRankMe| < min_delta_rankme durumu) → en erken epoch (en çok korunmuş rank / en az collapse)
-   hiçbir e eligible değilse → best.pth YAZILMAZ; last.pth kullan + "yakınsamadı" uyarısı
+# KARŞILAŞTIRMA (önerilen): final/plato checkpoint
+compare_ckpt = last.pth   (RankMe-platosu erken-durdurmasının bittiği, tam yakınsamış nokta)
+
+# R1 (ABLASYON — kullanma; kararsızlığını GÖSTERMEK için):
+eligible(e) ⟺ finite(m_e) ∧ z_std_e ≥ z_std_min ∧ L_val_e ≤ best_val_loss_max ∧ A_e ≤ best_align_max
+best.pth_R1 = argmax_{e : eligible(e)} RankMe_e   # ≡ ilk-yakınsayan epoch → oynak (L13)
 ```
 
-**Neden bu sıra.** Kapılar zorunlu koşullar (çökme yok, invaryans öğrenildi); RankMe yalnızca bu
-koşullar sağlandıktan sonra sıralama anahtarıdır. Bu, RankMe'nin random-init'te tavan yapıp
-eğitilmemiş bir epoch'u seçmesini engeller [Garrido2023 + gözlem: RankMe random-init'te en yüksek].
-*(Uygulanmış: `train_simsiam.py::is_converged` + seçim bloğu.)*
+**best.pth'nin rolü.** best.pth (converged max-RankMe) hâlâ **"max korunmuş rank" checkpoint'i**
+olarak yazılıyor (downstream'de daha yüksek-rank isteyen için bir seçenek), ama backbone
+KARŞILAŞTIRMASININ temeli DEĞİL. Yakınsama kapısı yine de random-init zirvesini (epoch 4) eler —
+o kısım doğrudur; sorun yalnızca *converged epoch'lar arasında* pikin oynaklığıdır. Downstream için
+final (kararlı, en collapse) vs diz (daha yüksek rank) tercihi **etiketli D3**'e bırakılır.
+*(Uygulanmış: `train_simsiam.py::is_converged` + seçim bloğu; `select_model.py --select latest`.)*
 
 ### D2 — Run-arası (backbone) seçimi
 
-Her run'ın **kendi best.pth**'si aynı sabit kohortta değerlendirilir (leaderboard).
+Her run'ın **final (plato) checkpoint'i** aynı sabit kohortta değerlendirilir (leaderboard;
+`select_model.py --select latest`). *(R1/best-converged yalnızca ablasyon olarak.)*
 
 ```
 1. Uygunluk: converged(run) ∧ ¬collapsed(run)              # yakınsamayan run diskalifiye
-2. Kararlılık: RankMe son K değerlendirmede çökmüyor (plato)  # dimensional-collapse koruması [Jing2022]
+2. Kararlılık: final plato checkpoint (oynak yakınsama piki DEĞİL)  # L13; dimensional-collapse [Jing2022]
 3. Birincil anahtar: RankMe ↓ sırala                        # [Garrido2023] en güçlü etiketsiz proxy
 4. Belirsizlik kuralı: iki run'ın RankMe %95 GA'ları örtüşüyorsa BERABERE   # jackknife GA (bootstrap DEĞİL, L9)
       (GA sütunları yoksa |ΔRankMe| < δ mutlak marjına düşer)
@@ -119,9 +131,10 @@ Her run'ın **kendi best.pth**'si aynı sabit kohortta değerlendirilir (leaderb
 6. Kazananı MARJI ve destekleyici/çelişen ikincil metriklerle raporla
 ```
 
-**Neden δ / bootstrap.** RankMe küçük kohortta gürültülüdür; ondalık farkları "kazanan" ilan
-etmek savunulamaz. Bootstrap GA ile ancak *anlamlı* marj kazanan sayılır. *(Uygulanacak — bkz.
-tasks/todo.md; şu an leaderboard elle okunuyor.)*
+**Neden marj / jackknife.** RankMe küçük kohortta gürültülüdür; ondalık farkları "kazanan" ilan
+etmek savunulamaz. Rank-tabanlı istatistikte tekrarlı-satır bootstrap efektif rankı aşağı yanlı
+iter; bu nedenle kohort-belirsizliği jackknife %95 GA ile verilir. Tohum-belirsizliği ise ayrı
+olarak tohumlar-arası %95 GA ile raporlanır. Ancak *ayrık/anlamlı* marjda kazanan sayılır.
 
 ### D3 — Nihai (denetimli, etiket geldiğinde)
 

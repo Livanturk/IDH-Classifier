@@ -1,10 +1,26 @@
 # Bildiri Deney Planı — 3D Beyin-MRI SimSiam SSL
 
-**Headline katkı.** 3D beyin-MRI üzerinde SimSiam SSL için backbone karşılaştırması + **literatüre
-dayalı, çökme-farkında, ETİKETSİZ model-seçim algoritması** (`MODEL_SELECTION.md`).
+**Headline katkı (KİLİTLİ 2026-07-23).** *Yöntem birincil* → **çöküş-farkında, yakınsama-kapılı,
+"kararlı-nokta" (final-plato) okuyan ETİKETSİZ model-seçim algoritması** (`MODEL_SELECTION.md`);
+naif seçimin (yakınsama-piki RankMe) kararsızlığı (seed-CV ≤%24) ana bulgu/ablasyon. Backbone
+karşılaştırması (densenet121>r18>r34) yöntemin *demonstrasyonu*.
 **Kapsam.** Saf SSL pretraining; IDH sınıflandırma sonraki makale (etiket yok → D3 gelecek-iş).
-**Bütçe.** Geniş (7×H100), tam ablasyon. **Değerlendirme.** Yalnızca etiketsiz batarya
-(RankMe/PR/uniformity/alignment/z_std + spektrum), çok-seed + bootstrap GA.
+**Format.** Tam konferans makalesi (8+ sayfa). **Bütçe.** Geniş (7×H100), tam ablasyon.
+**Değerlendirme.** Yalnızca etiketsiz batarya (RankMe birincil + LiDAR doğrulayıcı /PR/uniformity/
+alignment/z_std + spektrum), çok-seed + **jackknife** GA (bootstrap DEĞİL, L9).
+
+## 🔒 KAPSAM KİLİTLENDİ (2026-07-23) — kritik yol
+Kararlar: **manşet=yöntem**, **format=tam makale**, opsiyonellerin **hepsi dahil** (LiDAR + instabilite
+ablasyonu Fig 3 + site-level jackknife).
+- **Kritik yol (bel kemiği):** A) 9 unified koşu bitsin (r34 s43/s44 dahil) → B) GPU COMPARE→final-plato
+  leaderboard+seed-CI → C) Fig1 yörünge + D) Fig2 backbone bar (İng/600dpi).
+- **Zorunlu (seçildi):** E) Fig3 instabilite ablasyonu (R1 pik CI-örtüşür ↔ final CI-ayrışır);
+  LiDAR final-checkpoint doğrulayıcı; site-level (delete-one-cohort) block jackknife robustness.
+- **Prose senkron:** PAPER_* taslakları eski D1 çerçevesinden final-plato/R1-ablasyon çerçevesine.
+- **GPU beklerken yapılabilir (unblocked):** LiDAR kodu, site-jackknife kodu, Related Work + Method
+  yazımı, figür şablonları (İng/600dpi), dataset bölümü.
+- **İkincil (Aşama C/D):** mutlak-kalite (VICReg/W-MSE/bighead/longaug) ve recipe/crop ablasyonları —
+  tam makalede yer varsa; kritik yolu bloklamaz.
 
 > **Bilimsel gereklilik.** Etiket olmadığı için AUC ile doğrulayamıyoruz; dolayısıyla bildirinin
 > gücü tamamen **(a) seçim metodolojisinin savunulabilirliğine** ve **(b) metriklerin istatistiksel
@@ -47,16 +63,30 @@ dayalı, çökme-farkında, ETİKETSİZ model-seçim algoritması** (`MODEL_SELE
       4. adım reg-add-ons AÇIK (VICReg+W-MSE+clinical aug_strength). Tam koşu **exit 0** — regresyon yok.
       Yan-düzeltme: `--aug_preset` CLI'sine "clinical" eklendi (YAML'da vardı, CLI'da eksikti — tutarlılık).
 
-## Aşama A — Baseline backbone karşılaştırması ✅ (kısmen bitti)
+## ⭐ PLAN REVİZE (2026-07-23, L14) — TEK KOHORT, TÜM VERİ, YENİDEN KOŞU
+Veri seti değişti: harici UCSF (501) + UPENN (610) + BraTS-diğerleri (585) = **1696**. noucsf/withucsf ayrımı
+KALKTI. Önceki 18 koşu (noucsf/withucsf) artık geçersiz (yeni veriyle değil).
+- [x] **Stage 0.yeni:** `scripts/build_unified_dataset.py` → `data_unified/` (1696 symlink) ✓;
+      tek split `splits/splits_pretrain_all.json` (train=1526/val=170) ✓; `configs/simsiam_{r18,r34,densenet121}_unified.yaml` ✓;
+      launcher VARIANT=unified default ✓; harici-veri smoke (tümör-crop+auto-seg+8-bit) hatasız ✓.
+- [ ] **Stage A.yeni RUN (GPU):** `NODE=ai02 bash scripts/pretrain_stageA.sh` + `NODE=ai01 bash ...`
+      (VARIANT=unified default) → `COMPARE=1 bash ...`. 3 backbone × ≥3 seed = 9 koşu. Karşılaştırma = final plato (L13).
+- [ ] **LiDAR** (onaylı, gerekçelendirilecek): final checkpoint doğrulayıcı metrik.
+- [ ] **Figürler İngilizce + 600 dpi:** trajektori, backbone bar (RankMe+LiDAR±CI), spektrum, t-SNE (batch-effect + 8/16-bit).
+
+## Aşama A — (ESKİ, tek-seed + eski veri; referans olarak duruyor)
 
 - [x] resnet18 / resnet34 / densenet121, adaptive-clinical, 1 seed → densenet121 kazandı.
 - [x] best.pth convergence-gate düzeltmesi (epoch 19) + tazelenmiş spektrum/t-SNE.
 - [x] **A.1 configs** hazır: `configs/simsiam_{r18,r34,densenet121}_noucsf.yaml` (noucsf, adaptive-clinical,
       saf SimSiam = Stage-C matched baseline) + `scripts/pretrain_stageA.sh` (3 backbone × 3 seed = 9 iş,
       7 GPU'ya sıralı-kuyruk dağıtımı). Doğrulandı: config'ler yükleniyor, dağıtım doğru, --device çözülüyor.
-- [ ] **A.1 runs** (GPU, İKİ NODE): `NODE=ai02 bash scripts/pretrain_stageA.sh` (4 GPU: densenet+r34) ve
-      `NODE=ai01 bash scripts/pretrain_stageA.sh` (3 GPU: r18); ikisi bitince `COMPARE=1 bash ...`.
-      Node-aware launcher doğrulandı (9 iş, çift atama yok, makespan-optimal 2 dalga).
+- [x] **A.1 runs BİTTİ** (noucsf ×9 + withucsf ×9 = 18 koşu, hepsi yakınsadı, collapse yok).
+- [x] **A.2 analiz BİTTİ** (metrics.csv'den, GPU'suz): **densenet121 > r18 > r34** (final epoch, CI-anlamlı,
+      her iki kohortta). r34 EN KÖTÜ, r18 sağlam ikinci (tek-seed sonucunu düzeltti). +UCSF null (bkz. L13).
+      **KARAR:** karşılaştırma = final/plato checkpoint; R1 (converged-maxRankMe) oynak → ablasyon. Kod/doc
+      güncellendi (select_model --select latest, MODEL_SELECTION §D1/D2, launcher COMPARE→last.pth).
+      Figür: `figures/rankme_trajectory.png`. (Resmi leaderboard/GA için GPU'da `COMPARE=1 ... last.pth`.)
 - [x] **A.2 otomasyon** hazır: launcher run bitince otomatik evaluate (GA'lı leaderboard + t-SNE + spektrum)
       → `select_model --group_by backbone --mlflow` → **RankMe ± seed-arası %95 CI bar grafiği** + D2 kazanan,
       hepsi DagsHub'a. select_model artık seed'leri backbone bazında birleştiriyor (mean ± across-seed CI;

@@ -120,6 +120,84 @@ UCSF'in eğitimde olması. Split: `scripts/make_withucsf_split.py` → `splits_p
 bu encoder IDH makalesinde UCSF-harici-test için KULLANILAMAZ (UCSF görülmüş olur) — o rol noucsf'te kalır.
 Headline hâlâ noucsf; bu yalnızca "daha çok veri" etkisini gösteren etiketsiz bir ablasyon. **Kaynak.** [[paper-scope]], L8.
 
+## L13 — Çok-seed analizi: best.pth karşılaştırma temeli OLAMAZ; karşılaştırma = final plato
+
+**Bağlam.** Stage-A (noucsf ×9) + D.3 (withucsf ×9) = 18 koşu bitti (hepsi yakınsadı, hiç collapse yok).
+metrics.csv'lerden (GPU'suz) best.pth kuralını ve backbone sıralamasını analiz ettik.
+
+### Bulgu 1 — "converged max-RankMe" (mevcut best.pth kuralı, "R1") OYNAK
+- **R1 mekanik olarak her zaman ilk-yakınsayan epoch'u seçer**, çünkü RankMe yakınsamada zirve yapıp
+  monoton düşer (best→last %20–57 çöküş). Yani "yakınsamışlar arasında max" = "converged bölgenin en
+  solu" = ilk-yakınsayan.
+- **O zirvenin DEĞERİ oynaktır** — üç sebep: (a) dik bir geçiş (transient) üzerinde; (b) her-5-epoch
+  ızgarasıyla örneklendiğinden ızgara-bağımlı (her-1-epoch olsa farklı çıkardı); (c) yakınsama epoch'u
+  **seed'e göre kayıyor** (9 vs 14). Kanıt — r18 noucsf: s42/s43 epoch 9'da yakınsadı → RankMe 12–13;
+  s44 epoch 14'te → RankMe 8. Aynı backbone, **CV %24**.
+- Sonuç: R1'de **densenet ile r18 istatistiksel olarak AYRILAMIYOR** (CI örtüşüyor) → karşılaştırma bozuluyor.
+- **Kavramsal ek:** ilk-yakınsayan = yakınsamışların EN AZ yakınsamışı (alignment ~0.11, en yüksek);
+  oradaki yüksek rank'ın bir kısmı henüz collapse edilmemiş **augmentasyon-nuisance varyansı** → "en çok
+  bilgi" değil, kısmen "temizlenmemiş çöp".
+
+### Bulgu 2 — Dört kuralın kıyası (seed-CV, sıralama anlamlılığı)
+| Kural | epoch | ort.CV | sıralama |
+|---|---|---|---|
+| R1 first-conv maxRankMe (mevcut) | 9–14 (seed'e göre) | %15–17 | densenet**≈**r18 (muğlak) |
+| R2 last epoch | 84–89 | %8–10 | densenet>r18>r34 ✓ |
+| **R3 fixed epoch=79** | 79 (hep aynı) | **%7–8** | densenet>r18>r34 ✓ |
+| R4 stability-window (+20ep≈34) | ~34 | %9–11 | densenet>r18>r34 ✓ |
+
+### KARAR (bildiri için)
+- **Karşılaştırma temeli = final/plato checkpoint (last.pth).** Basit, ızgara/seed-zamanlaması bağımsız,
+  tekrarlanabilir, savunulabilir. Erken-durdurma zaten **RankMe-platosu**yla tetiklendiğinden "final" keyfi
+  değil, prensipli bir durak.
+- **R1'i seçim temeli olmaktan çıkar → "naif seçim kararsızdır" ABLASYONU olarak göster.** Bu, kapılı +
+  kararlı-nokta metodolojimizin *neden gerekli* olduğunun kanıtı = zayıflık değil, katkıyı güçlendiren bulgu.
+- **Ana figür:** RankMe-vs-epoch yörüngesi (`figures/rankme_trajectory.png`) — random-init yüksek → yakınsama
+  piki → collapse; densenet tüm yörüngede üstte. Neden-zirve-değil sorusunu görselle önceden yanıtlar.
+- **best.pth'nin rolü:** "max korunmuş rank" checkpoint'i olarak kalır (downstream için bir seçenek);
+  final (kararlı, en collapse) vs diz (daha yüksek rank) tercihi **etiketli D3**'e bırakılır.
+
+### Bulgu 3 — Backbone sıralaması (çok-seed, DÜZELTİLMİŞ) + kohort etkisi
+- **densenet121 > r18 > r34**, her iki kohortta final epoch'ta CI-anlamlı. **r34 EN KÖTÜ** (tek-seed'de
+  ortadaydı; çok-seed düzeltti — 63M parametresi işe yaramıyor). **r18 sağlam İKİNCİ** (tek-seed'de en
+  kötü sanılıyordu, yanlışmış). Tek-seed sonucunun neden güvenilmez olduğunun kanıtı.
+- **+UCSF etkisiz (null):** densenet 7.37→8.77 vb. ama tüm CI'lar örtüşüyor → daha çok veri etiketsiz
+  temsil kalitesini anlamlı artırmadı (889 denek zaten yeterli / collapse yönteme bağlı). Raporlanabilir.
+
+**Uygulandı.** `select_model.py --select latest` (default; best-converged=R1 ablasyon), MODEL_SELECTION.md
+§D1/D2, `train_simsiam.py` best.pth yorumu, `pretrain_stageA.sh` COMPARE→last.pth, yörünge figürü.
+**Kaynak.** [Garrido2023], [Jing2022], [[paper-scope]].
+
+## L14 — Kohort kararı GÜNCELLENDİ (2026-07-23): tek kohort, TÜM veri (L8/L12'yi ezer)
+
+**Bağlam.** cancerimagingarchive'den harici UCSF (501) + UPENN (610) indirildi (BraTS-içi 263/403'ten
+çok); BraTS-içi olanlar bunlarla değiştiriliyor. Kullanıcı: "noucsf vs withucsf kalksın, hepsi olacak."
+**Karar.** TEK kohort = BraTS-diğerleri (585) + harici UCSF (501) + harici UPENN (610) ≈ **1696**.
+noucsf/withucsf ayrımı, +UCSF ablasyonu (eski D.3), ve `*_noucsf/withucsf` split/config'leri **iptal**.
+**Çapraz-makale (L8/L12'yi bilinçli tersine çevirir):** UCSF artık pretraining'de → IDH makalesinde temiz
+harici-test OLAMAZ; kullanıcı bunu bilerek onayladı. **Veri harmonizasyonu:** harici setler BraTS uzayında
+(240×240×155, 1mm, skull-stripped, atlas) → geometri OK; **8-bit (harici) vs 16-bit (BraTS)** farkı z-score
++ aug ile örtülür (8-bit standarttır); UPENN harici seg=otomatik. Heterojenliği t-SNE batch-effect ile
+doğrula + bildiride belgele. **Uygulama:** birleştirilmiş symlink dizini (kanonik `<subj>_t1/..._seg`) →
+scan_subjects değişmeden çalışır. **Kaynak.** [[paper-scope]].
+
+## L15 — Shared-storage `.nii.gz` okuması transient hata verebilir; dosya bozulmasını önce ayır
+
+**Bağlam.** Unified Stage-A'da ai02 üzerindeki dört eşzamanlı run, epoch 0'da farklı DataLoader
+worker'larında `zlib.error: invalid block type` ile durdu. Hata model/loss'ta değil,
+`nibabel -> gzip` NIfTI okumasındaydı.
+**Kontrol.** `data_unified` altındaki 8,480 symlink-hedefli `.nii.gz` için `gzip -t` taraması
+başarılı oldu; kalıcı olarak bozuk bir dosya saptanmadı. Bu nedenle ilk açıklama, 4 run × 12 worker'ın
+shared storage üzerinde oluşturduğu eşzamanlı gzip/I/O yükünde transient read failure'dır; persistent
+bir dosya hatası olsaydı tarama veya retry'nin son hatası exact path'i vermelidir.
+**Çıkarım/Kural.** Gzipped NIfTI bir shared filesystem'den okunuyorsa (i) tüm cohort'u `gzip -t` ile
+önce doğrula, (ii) loader'da fresh `nib.load(..., mmap=False, keep_file_open=False)` ile sınırlı retry
+kullan, (iii) persistent hata mesajına dosya yolunu yaz, (iv) eşzamanlı worker sayısını I/O bütçesine
+göre indir. Retry, bozuk dosyayı gizlemek için değil transient hata ile kalıcı hatayı ayırmak içindir.
+**Uygulandı.** `data._read_nifti`: 3 deneme + yol içeren nihai hata; unified config'lerde
+`num_workers: 12 → 4` (4 GPU job'unda toplam 48 → 16 worker). Rerun epoch 0'da çöktüğü için checkpoint
+ve deney sonucu kaybı yoktur.
+
 ## L6 — Repo yerleşimi
 
 Kod `/datasets/mri_datasets/SSL`'de; git `/home/ibm`'de (onun `SSL/`'i silinmiş). `BraTS2021`

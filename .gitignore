@@ -11,7 +11,7 @@ mlruns/
 BraTS2021/
 UCSF-PGDM/
 UCSF-PDGM/
-
+UPENN-GBM/
 # Machine-specific / local artifacts
 SSL/BraTS2021
 SSL/checkpoints/
@@ -25,4 +25,10 @@ SSL/figures/
 SSL/artifacts/
 SSL/runs/
 CLAUDE.md
+AGENTS.md
 commands.txt
+
+
+# unified dataset (symlinks to ignored data)
+SSL/data_unified/
+data_unified/

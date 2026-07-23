@@ -16,6 +16,8 @@ from __future__ import annotations
 import glob
 import json
 import os
+import time
+import zlib
 from typing import Optional
 
 import nibabel as nib
@@ -39,6 +41,7 @@ from monai.transforms import (
 )
 
 REQUIRED_SUFFIXES = ("t1", "t1ce", "t2", "flair")
+NIFTI_READ_RETRIES = 3
 
 
 # --------------------------------------------------------------------------- #
@@ -101,6 +104,31 @@ CROP_MODES = ("brain", "tumor", "tumor_margin")
 # --------------------------------------------------------------------------- #
 # Volume loading + normalization
 # --------------------------------------------------------------------------- #
+def _read_nifti(path: str, dtype: np.dtype | None = None) -> np.ndarray:
+    """Materialize a NIfTI volume, retrying transient reads from shared storage.
+
+    The unified cohort consists of symlinks to gzip-compressed NIfTI files on shared storage.
+    A busy multi-GPU launch can occasionally surface a transient gzip/zlib read error even though
+    the file is valid on disk.  Retrying a fresh ``nib.load`` avoids failing an entire SSL run for
+    that transient condition.  A persistent error remains fatal and names the exact source file.
+    """
+    last_error: Exception | None = None
+    for attempt in range(1, NIFTI_READ_RETRIES + 1):
+        try:
+            img = nib.load(path, mmap=False, keep_file_open=False)
+            return np.asarray(img.dataobj, dtype=dtype)
+        except (OSError, EOFError, zlib.error) as exc:
+            last_error = exc
+            if attempt < NIFTI_READ_RETRIES:
+                time.sleep(0.15 * attempt)
+
+    raise RuntimeError(
+        f"Failed to read gzipped NIfTI after {NIFTI_READ_RETRIES} attempts: {path}. "
+        "The file may be corrupted or shared-storage I/O may be unstable; run "
+        f"`gzip -t {path!r}` to distinguish them."
+    ) from last_error
+
+
 def _load_volume(record: dict, modalities: tuple[str, ...], load_seg: bool):
     """Load modalities into a (C, H, W, D) float32 array cropped to the brain bbox.
 
@@ -109,7 +137,7 @@ def _load_volume(record: dict, modalities: tuple[str, ...], load_seg: bool):
     vols = []
     for m in modalities:
         p = os.path.join(record["dir"], f"{record['id']}_{m}.nii.gz")
-        vols.append(np.asarray(nib.load(p).dataobj, dtype=np.float32))
+        vols.append(_read_nifti(p, dtype=np.float32))
     x = np.stack(vols, axis=0)  # (C, H, W, D)
 
     seg = None
@@ -120,7 +148,7 @@ def _load_volume(record: dict, modalities: tuple[str, ...], load_seg: bool):
                 f"crop_mode requires segmentation but {segp} is missing. Use crop_mode=brain "
                 f"or provide/auto-generate a mask for subject {record['id']}."
             )
-        seg = np.asarray(nib.load(segp).dataobj)
+        seg = _read_nifti(segp)
 
     mask = x.sum(axis=0) > 0  # skull-stripped -> union of non-zero voxels = brain
     if mask.any():
