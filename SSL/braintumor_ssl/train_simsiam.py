@@ -16,6 +16,7 @@ import math
 import os
 import time
 
+import numpy as np
 import torch
 import yaml
 from torch.utils.data import DataLoader
@@ -26,8 +27,9 @@ from braintumor_ssl.tracking import Tracker
 from braintumor_ssl.utils import (
     AverageMeter,
     alignment,
-    alpha_req,
+    alpha_req_fit,
     cosine_lr,
+    delete_d_jackknife_se,
     lidar,
     participation_ratio,
     rankme,
@@ -159,7 +161,11 @@ def validate(model: SimSiam, val_records: list, cfg: dict, device: str, use_amp:
     from torch.nn.modules.batchnorm import _BatchNorm
 
     was_training = model.training
-    nw = min(cfg["num_workers"], 2)
+    # Validation is no longer a cheap side-show: 200 val subjects x (precise-BN pass + eval view +
+    # lidar_views augmented views) is ~2400 volume-loads per epoch and it runs EVERY epoch, so with
+    # the old hard cap of 2 workers it cost more wall time than the training epoch itself. It gets
+    # its own worker count because nothing else is running while it does.
+    nw = int(cfg.get("val_num_workers", 0) or min(cfg["num_workers"], 2))
     bs = cfg["batch_size"]
     max_bn = 2 if cfg["smoke"] else 200
 
@@ -184,23 +190,33 @@ def validate(model: SimSiam, val_records: list, cfg: dict, device: str, use_amp:
         m.running_var.copy_(rv)
         m.num_batches_tracked.copy_(nb)
 
-    # --- val loss + alignment with the model's own BN (eval mode), two augmented views ---
+    # --- val loss + alignment + LiDAR's surrogate classes, with the model's own BN (eval mode) ---
+    # LiDAR treats each subject as a class and its augmented views as that class's samples, so its
+    # within-subject scatter has (A-1) degrees of freedom per subject. At the A=2 minimum that is 1
+    # dof for a 256x256 matrix and the ridge does the work; A>2 is what makes the estimate real. The
+    # extra views cost one crop+augment each, NOT another volume read (data.BraTSViews.n_views).
+    n_views = max(2, int(cfg.get("lidar_views", 2)))
     model.eval()
-    two_ld = DataLoader(make_views(val_records, cfg, mode="train"), batch_size=bs,
+    two_ld = DataLoader(make_views(val_records, cfg, mode="train", n_views=n_views), batch_size=bs,
                         shuffle=False, num_workers=nw, pin_memory=(device == "cuda"))
-    losses, h1s, h2s = [], [], []
+    losses = []
+    hs: list[list[torch.Tensor]] = [[] for _ in range(n_views)]
     for it, batch in enumerate(two_ld):
         if cfg["smoke"] and it >= 2:
             break
         x1 = batch["view1"].to(device, non_blocking=True)
         x2 = batch["view2"].to(device, non_blocking=True)
         with torch.amp.autocast("cuda", enabled=use_amp):
-            out = model(x1, x2)
+            out = model(x1, x2)                 # views 1-2 also give the val loss + alignment
             loss = simsiam_loss(out)
+            hs[0].append(out["h1"].float().cpu())   # 256-d encoder features, view 1 (paired w/ h2)
+            hs[1].append(out["h2"].float().cpu())   # 256-d encoder features, view 2
+            for v in range(2, n_views):             # extra LiDAR-only views: encoder path only
+                hs[v].append(model.encode(batch[f"view{v + 1}"].to(device, non_blocking=True))
+                             .float().cpu())
         losses.append(float(loss.item()))
-        h1s.append(out["h1"].float().cpu())     # 256-d encoder features, view 1 (paired w/ h2)
-        h2s.append(out["h2"].float().cpu())     # 256-d encoder features, view 2
-    h1, h2 = torch.cat(h1s), torch.cat(h2s)
+    views = [torch.cat(h) for h in hs]
+    h1, h2 = views[0], views[1]
 
     if was_training:
         model.train()
@@ -208,17 +224,61 @@ def validate(model: SimSiam, val_records: list, cfg: dict, device: str, use_amp:
     #   rankme    — effective rank of the single (eval) view features (want HIGH)
     #   lidar     — augmentation-invariant rank from the two paired views (want HIGH)
     #   alpha_req — power-law decay exponent of the eval-view spectrum (want CLOSE TO 1)
+    # alpha-ReQ's fit window is a config knob, not a default: with N < d the smallest sample
+    # eigenvalues are biased down and steepen the slope, so only the leading fraction of the
+    # spectrum is fitted (calibrated on synthetic power-law spectra; see the config comment).
+    areq_kw = {"k_min": int(cfg.get("areq_k_min", 1)),
+               "k_max_frac": float(cfg.get("areq_k_max_frac", 1.0))}
+    fit = alpha_req_fit(feats, **areq_kw)
+
+    # Sampling uncertainty of each metric OVER SUBJECTS, by delete-d jackknife. This is what makes
+    # "is epoch B better than epoch A?" answerable: at n=200 RankMe's SE is ~0.5, i.e. TEN TIMES the
+    # fixed min_delta_rankme default, so a fixed threshold selects noise. ~2 s/epoch for all three.
+    reps = int(cfg.get("select_se_reps", 0) or 0)
+    se_kw = {"drop_frac": float(cfg.get("select_se_drop_frac", 0.1)), "reps": reps,
+             "seed": int(cfg.get("seed", 42))}
+    nan = float("nan")
+    se_jk = {"rankme": nan, "lidar": nan, "alpha_req": nan}
+    if reps >= 2:
+        se_jk["rankme"] = delete_d_jackknife_se(rankme, feats, **se_kw)
+        se_jk["lidar"] = delete_d_jackknife_se(lidar, *views, **se_kw)
+        se_jk["alpha_req"] = delete_d_jackknife_se(
+            lambda Z: alpha_req_fit(Z, **areq_kw)["alpha"], feats, **se_kw)
     return {
         "val_loss": float(sum(losses) / len(losses)) if losses else float("nan"),
         "z_std": representation_std(feats),
         "rankme": rankme(feats),
-        "lidar": lidar(h1, h2),
-        "alpha_req": alpha_req(feats),
+        "lidar": lidar(*views),
+        "lidar_views": len(views),
+        "alpha_req": fit["alpha"],
+        "areq_r2": fit["r2"],
+        "areq_se": fit["se"],
+        "areq_k_used": fit["k_used"],
+        "se_jk": se_jk,                      # per-metric sampling SE over subjects (nan if disabled)
         "participation_ratio": participation_ratio(feats),
         "alignment": alignment(h1, h2),
         "uniformity": uniformity(feats),
         "n_val": int(feats.shape[0]),
+        # raw features, for the per-epoch dump — every spectral quantity above can then be
+        # recomputed post-hoc (different fit window, projection, resampling) without retraining
+        "_features": {"eval": feats, **{f"view{i + 1}": v for i, v in enumerate(views)}},
     }
+
+
+def dump_val_features(cfg: dict, epoch: int, feats: dict) -> None:
+    """Write this epoch's val features to <out_dir>/val_features/ep####.npz (opt-in).
+
+    ~0.6 MB per validation at 200 val subjects x 256-d x 3 matrices (eval view + the two augmented
+    views LiDAR pairs). Cheap insurance with a large payoff: the fit window, the RankMe/LiDAR
+    estimators, resampling-based selection stability and any lower-dimensional projection check can
+    all be recomputed from these AFTER the run, instead of having to be decided correctly before it.
+    """
+    if not cfg.get("dump_val_features", False):
+        return
+    d = os.path.join(cfg["out_dir"], "val_features")
+    os.makedirs(d, exist_ok=True)
+    np.savez_compressed(os.path.join(d, f"ep{epoch:04d}.npz"),
+                        **{k: v.numpy().astype(np.float32) for k, v in feats.items()})
 
 
 def collapse_thresholds(n_val: int, cfg: dict) -> dict:
@@ -271,15 +331,23 @@ def metric_specs(cfg: dict) -> list[dict]:
         {"key": "lidar", "name": "LiDAR", "file": "bestLiDAR.pth",
          "score": lambda m: m["lidar"], "delta": float(cfg.get("min_delta_lidar", 0.0) or 0.0),
          "goal": "max LiDAR (augmentation-invariant rank)"},
+        # alpha-ReQ additionally needs its power-law fit to actually HOLD: the OLS slope is defined
+        # for any spectrum, so without an R^2 floor a badly non-power-law epoch can post an alpha
+        # near 1 by accident and win. Epochs below the floor score -inf, i.e. are never selected.
         {"key": "alpha_req", "name": "alpha-ReQ", "file": "bestA-ReQ.pth",
-         "score": lambda m: -abs(m["alpha_req"] - 1.0),
+         "score": lambda m: (-abs(m["alpha_req"] - 1.0)
+                             if (m.get("areq_r2") is None or not math.isfinite(m.get("areq_r2", float("nan")))
+                                 or m["areq_r2"] >= float(cfg.get("areq_r2_min", 0.0)))
+                             else float("-inf")),
          "delta": float(cfg.get("min_delta_areq", 0.0) or 0.0), "goal": "alpha-ReQ closest to 1.0"},
     ]
 
 
-def selection_record(spec: dict, epoch: int, vm: dict, train_loss: float, lr: float) -> dict:
+def selection_record(spec: dict, epoch: int, vm: dict, train_loss: float, lr: float,
+                     smoothed: float = float("nan"), threshold: float = float("nan"),
+                     se: float = float("nan"), window: int = 1) -> dict:
     """Provenance stored inside each best*.pth: which metric picked it, its value, the OTHER two
-    metrics at that epoch, the losses, the LR, and a human-readable reason."""
+    metrics at that epoch, the losses, the LR, the decision rule that fired, and a readable reason."""
     return {
         "metric": spec["key"], "metric_name": spec["name"],
         "metric_value": round(float(vm[spec["key"]]), 5), "goal": spec["goal"], "epoch": int(epoch),
@@ -287,7 +355,18 @@ def selection_record(spec: dict, epoch: int, vm: dict, train_loss: float, lr: fl
                           if k != spec["key"]},
         "train_loss": round(float(train_loss), 5), "val_loss": round(float(vm["val_loss"]), 5),
         "lr": float(lr),
-        "reason": f"{spec['goal']} among converged, non-collapsed epochs (selected at epoch {epoch})",
+        # alpha's fit diagnostics travel with EVERY checkpoint, not just the alpha-selected one:
+        # an alpha reported without its R^2 and its fit window is not interpretable.
+        "areq_fit": {"r2": round(float(vm["areq_r2"]), 5), "se": round(float(vm["areq_se"]), 5),
+                     "k_used": int(vm["areq_k_used"])},
+        "n_val": int(vm["n_val"]),
+        # what actually decided this save: the smoothed score, the sampling SE it had to clear, and
+        # how many evals the trailing window held (a window of 1 means smoothing was off/warming up)
+        "rule": {"smoothed_score": round(float(smoothed), 5), "threshold": round(float(threshold), 5),
+                 "metric_se": round(float(se), 5), "window": int(window)},
+        "reason": (f"{spec['goal']} among converged, non-collapsed epochs; smoothed over "
+                   f"{window} eval(s), beat the previous best by more than {threshold:.4f} "
+                   f"(selected at epoch {epoch})"),
     }
 
 
@@ -353,8 +432,11 @@ def main() -> None:
     # multi-metric best-checkpoint / early-stop monitor state (used only when val_every > 0).
     # One tracker per metric: best score-so-far, the epoch that achieved it, and a plateau counter.
     specs = metric_specs(cfg)
-    best = {s["key"]: {"score": -float("inf"), "epoch": -1, "no_improve": 0, "value": float("nan")}
+    best = {s["key"]: {"score": -float("inf"), "epoch": -1, "no_improve": 0, "value": float("nan"),
+                       "hist": []}                       # trailing scores for the smoothing window
             for s in specs}
+    smooth_w = max(1, int(cfg.get("select_smooth_window", 1)))
+    se_mult = float(cfg.get("select_se_mult", 0.0) or 0.0)
     collapse_run = 0
     metrics_history: list[dict] = []
 
@@ -448,6 +530,7 @@ def main() -> None:
         do_val = bool(val_records) and ((epoch + 1) % cfg["val_every"] == 0 or is_last)
         if do_val:
             vm = validate(model, val_records, cfg, device, use_amp)
+            dump_val_features(cfg, epoch, vm.pop("_features"))   # pop: keep tensors out of the ckpt
             th = collapse_thresholds(vm["n_val"], cfg)
             collapsed, why = is_collapsed(vm, th)
             converged = is_converged(vm, cfg)
@@ -459,22 +542,38 @@ def main() -> None:
             lr_now = optimizer.param_groups[0]["lr"]
 
             # --- per-metric best-checkpoint update (shared eligibility gate; L13) ---
+            # Two guards against selecting a noise spike rather than a better representation:
+            #   (a) the score is a trailing mean over the last `select_smooth_window` ELIGIBLE evals
+            #       (causal, so it still works online; the saved weights sit at the window's end,
+            #       i.e. inside the plateau rather than on its leading edge);
+            #   (b) an improvement must clear `select_se_mult` x the metric's own sampling SE over
+            #       subjects, not a hand-set constant. min_delta_* survives only as a floor.
             eligible = converged and (not collapsed)
             for s in specs:
                 st = best[s["key"]]
                 raw = vm[s["key"]]
-                ok = eligible and math.isfinite(raw) and math.isfinite(s["score"](vm))
-                improved = ok and s["score"](vm) > st["score"] + s["delta"]
+                score_now = s["score"](vm)
+                ok = eligible and math.isfinite(raw) and math.isfinite(score_now)
+                if ok:
+                    st["hist"].append(score_now)
+                    del st["hist"][:-smooth_w]                 # keep only the trailing window
+                score = sum(st["hist"]) / len(st["hist"]) if st["hist"] else float("-inf")
+                se = vm["se_jk"].get(s["key"], float("nan"))
+                thresh = max(s["delta"], se_mult * se if math.isfinite(se) else 0.0)
+                improved = ok and score > st["score"] + thresh
                 if improved:
-                    st["score"], st["epoch"], st["no_improve"], st["value"] = s["score"](vm), epoch, 0, raw
-                    sel = selection_record(s, epoch, vm, loss_m.avg, lr_now)
+                    st["score"], st["epoch"], st["no_improve"], st["value"] = score, epoch, 0, raw
+                    sel = selection_record(s, epoch, vm, loss_m.avg, lr_now,
+                                           smoothed=score, threshold=thresh, se=se, window=len(st["hist"]))
                     ckpt = {"epoch": epoch, "model": model.state_dict(),
                             "optimizer": optimizer.state_dict(), "cfg": cfg,
                             "val_metrics": vm, "selection": sel}
                     save_checkpoint(ckpt, os.path.join(cfg["out_dir"], s["file"]))
                     if s["key"] == "rankme":            # back-compat alias for evaluate/select_model tooling
                         save_checkpoint(ckpt, os.path.join(cfg["out_dir"], "best.pth"))
-                    print(f"  -> new best {s['name']}={raw:.4f} @ epoch {epoch} (saved {s['file']})")
+                    print(f"  -> new best {s['name']}={raw:.4f} (smoothed {score:.4f} over "
+                          f"{len(st['hist'])} evals, cleared +{thresh:.4f}) @ epoch {epoch} "
+                          f"(saved {s['file']})")
                 elif st["epoch"] >= 0:
                     # only count a plateau once this metric has a converged baseline to plateau from —
                     # pre-convergence evals are "not learned yet", not "improvement stalled".
@@ -489,7 +588,14 @@ def main() -> None:
                 "train_loss": round(loss_m.avg, 5), "train_z_std": round(std_m.avg, 5),
                 "val_loss": round(vm["val_loss"], 5), "z_std": round(vm["z_std"], 5),
                 "rankme": round(vm["rankme"], 4), "lidar": round(vm["lidar"], 4),
-                "alpha_req": round(vm["alpha_req"], 4),
+                "lidar_views": vm["lidar_views"], "alpha_req": round(vm["alpha_req"], 4),
+                "areq_r2": round(vm["areq_r2"], 4), "areq_se": round(vm["areq_se"], 5),
+                "areq_k_used": vm["areq_k_used"],
+                # sampling SE of each metric over subjects — the scale any epoch-to-epoch
+                # difference has to beat before it means anything
+                "rankme_se_jk": round(vm["se_jk"]["rankme"], 4),
+                "lidar_se_jk": round(vm["se_jk"]["lidar"], 4),
+                "areq_se_jk": round(vm["se_jk"]["alpha_req"], 5),
                 "participation_ratio": round(vm["participation_ratio"], 4),
                 "alignment": round(vm["alignment"], 5), "uniformity": round(vm["uniformity"], 5),
                 "n_val": vm["n_val"], "converged": converged, "collapsed": collapsed,
@@ -500,6 +606,7 @@ def main() -> None:
             }
             tracker.log_metrics({"val_loss": vm["val_loss"], "z_std": vm["z_std"], "rankme": vm["rankme"],
                                  "lidar": vm["lidar"], "alpha_req": vm["alpha_req"], "lr": lr_now,
+                                 "areq_r2": vm["areq_r2"], "areq_se": vm["areq_se"],
                                  "participation_ratio": vm["participation_ratio"],
                                  "alignment": vm["alignment"], "uniformity": vm["uniformity"],
                                  "converged": float(converged), "collapsed": float(collapsed)}, step=epoch)

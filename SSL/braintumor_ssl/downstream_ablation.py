@@ -1,4 +1,15 @@
-"""Downstream ablation scaffold: which selection rule (RankMe / LiDAR / alpha-ReQ) transfers best?
+"""SUPERSEDED by `idh_probe.py` — kept for its internal-split scaffold only.
+
+The UCSF-is-external rule this module enforces was scoped to the downstream PAPER. For the
+bildiri the user decided (2026-07-27) that UCSF-PDGM is the labelled downstream cohort and is
+used NOW, so the frozen-probe evaluation lives in `braintumor_ssl.idh_probe`, which scores the
+four checkpoints on UCSF with repeated CV, in-fold thresholds, clinical baselines and paired
+delta-AUC. UCSF stays out of SSL PRETRAINING either way — that is what keeps it a clean
+transfer target and is unchanged.
+
+Original docstring follows.
+
+Downstream ablation scaffold: which selection rule (RankMe / LiDAR / alpha-ReQ) transfers best?
 
 From ONE encoder run this loads the three per-metric best checkpoints (+ `last.pth` as the
 final-plateau reference), extracts 256-d features on an INTERNAL downstream split, and — once an

@@ -78,8 +78,47 @@ def _pearson(xs: list[float], ys: list[float]) -> float:
     return sxy / math.sqrt(sxx * syy) if sxx > 0 and syy > 0 else math.nan
 
 
+def _rank(vals: list[float]) -> list[float]:
+    """Fractional ranks (ties averaged) — the transform that turns Pearson into Spearman."""
+    order = sorted(range(len(vals)), key=lambda i: vals[i])
+    out = [0.0] * len(vals)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and vals[order[j + 1]] == vals[order[i]]:
+            j += 1
+        avg = (i + j) / 2.0 + 1.0
+        for k in range(i, j + 1):
+            out[order[k]] = avg
+        i = j + 1
+    return out
+
+
+def _spearman(xs: list[float], ys: list[float]) -> float:
+    """Rank correlation. Preferred over Pearson here: nothing says RankMe and LiDAR should move
+    together LINEARLY — the question is only whether they order the epochs the same way, and ranks
+    are also far less sensitive to a single outlying epoch than raw values."""
+    pairs = [(x, y) for x, y in zip(xs, ys) if math.isfinite(x) and math.isfinite(y)]
+    if len(pairs) < 3:
+        return math.nan
+    return _pearson(_rank([x for x, _ in pairs]), _rank([y for _, y in pairs]))
+
+
 def _col(rows: list[dict], key: str) -> list[float]:
     return [r.get(key, math.nan) for r in rows]
+
+
+def _eligible(rows: list[dict]) -> list[dict]:
+    """Rows that passed the convergence + non-collapse gate.
+
+    Correlations are computed over these ONLY. Including the random-init epochs would mostly measure
+    "all three metrics fall away from random initialization", which is a shared transient, not
+    evidence that they order the candidate checkpoints the same way.
+    """
+    def flag(r, k):
+        return str(r.get(k)).lower() in ("true", "1", "1.0")
+    keep = [r for r in rows if flag(r, "converged") and not flag(r, "collapsed")]
+    return keep if len(keep) >= 3 else rows
 
 
 def report_run(run_dir: str) -> dict:
@@ -99,7 +138,8 @@ def report_run(run_dir: str) -> dict:
 
     # ---- (1) per-checkpoint table -------------------------------------------------
     print("\n[1] Selected checkpoints (converged, non-collapsed epochs only):")
-    print(f"    {'checkpoint':<14}{'epoch':>6}{'value':>10}{'train_loss':>12}{'val_loss':>10}{'lr':>10}")
+    print(f"    {'checkpoint':<14}{'epoch':>6}{'value':>10}{'train_loss':>12}{'val_loss':>10}{'lr':>10}"
+          f"{'n_val':>7}{'a_R2':>8}")
     present = {}
     for key, (fname, pretty, _) in METRICS.items():
         s = sels[key]
@@ -107,9 +147,13 @@ def report_run(run_dir: str) -> dict:
             print(f"    {pretty:<14}{'—':>6}   (not written — no eligible epoch)")
             continue
         present[key] = s
+        # alpha's fit quality is shown for EVERY checkpoint: it says whether the alpha reported in
+        # this run's spectrum is interpretable at all, not just whether alpha-ReQ picked this epoch.
+        fit = s.get("areq_fit") or {}
         print(f"    {pretty:<14}{int(s['epoch']):>6}{s.get('metric_value', float('nan')):>10.4f}"
               f"{s.get('train_loss', float('nan')):>12.4f}{s.get('val_loss', float('nan')):>10.4f}"
-              f"{s.get('lr', float('nan')):>10.5f}")
+              f"{s.get('lr', float('nan')):>10.5f}{s.get('n_val', 0):>7}"
+              f"{fit.get('r2', float('nan')):>8.3f}")
 
     # ---- (2)/(3) epoch agreement --------------------------------------------------
     epochs = {k: int(s["epoch"]) for k, s in present.items()}
@@ -137,9 +181,12 @@ def report_run(run_dir: str) -> dict:
         lo, hi = min(epochs.values()), max(epochs.values())
         print(f"\n[4] Epoch spread: {hi - lo} epochs (from {lo} to {hi}).")
         if rows:
-            rk, li, ar = _col(rows, "rankme"), _col(rows, "lidar"), _col(rows, "alpha_req")
-            print(f"    curve correlation over epochs:  RankMe~LiDAR={_pearson(rk, li):+.2f}  "
-                  f"RankMe~alpha-ReQ={_pearson(rk, ar):+.2f}  LiDAR~alpha-ReQ={_pearson(li, ar):+.2f}")
+            elig = _eligible(rows)
+            rk, li, ar = _col(elig, "rankme"), _col(elig, "lidar"), _col(elig, "alpha_req")
+            print(f"    curve rank-correlation over {len(elig)} eligible epochs (Spearman):  "
+                  f"RankMe~LiDAR={_spearman(rk, li):+.2f}  "
+                  f"RankMe~alpha-ReQ={_spearman(rk, ar):+.2f}  "
+                  f"LiDAR~alpha-ReQ={_spearman(li, ar):+.2f}")
             print("    (high +corr => metrics track together; near 0 / negative => they read the "
                   "spectrum differently, so their best epochs legitimately diverge.)")
     else:
@@ -151,8 +198,9 @@ def report_run(run_dir: str) -> dict:
         last = rows[-1]
         ever_collapsed = any(str(r.get("collapsed")).lower() in ("true", "1", "1.0") for r in rows)
         n_converged = sum(1 for r in rows if str(r.get("converged")).lower() in ("true", "1", "1.0"))
-        rk, li, ar = _col(rows, "rankme"), _col(rows, "lidar"), _col(rows, "alpha_req")
-        trend = _pearson(list(range(len(rk))), rk)
+        elig = _eligible(rows)
+        rk, li, ar = _col(elig, "rankme"), _col(elig, "lidar"), _col(elig, "alpha_req")
+        trend = _spearman(list(range(len(rk))), rk)
         print(f"    epochs validated={len(rows)}  converged={n_converged}  ever_collapsed={ever_collapsed}")
         print(f"    end plateau counters: RankMe+{int(last.get('no_improve_rankme', 0) or 0)} "
               f"LiDAR+{int(last.get('no_improve_lidar', 0) or 0)} "
@@ -161,7 +209,7 @@ def report_run(run_dir: str) -> dict:
         if stopped:
             print(f"    early-stopped: {last.get('stop_reason', '')}")
         # convergent-validity read: do RankMe and LiDAR agree on the direction of change?
-        agree = _pearson(rk, li)
+        agree = _spearman(rk, li)
         msg = ("RankMe & LiDAR give a CONSISTENT signal" if agree > 0.3 else
                "RankMe & LiDAR DISAGREE — treat the run as ambiguous (defer to labelled probe)"
                if agree < -0.3 else "RankMe & LiDAR are weakly related")
@@ -182,6 +230,16 @@ def report_run(run_dir: str) -> dict:
         summary[f"{pre}_train_loss"] = s.get("train_loss", "") if s else ""
         summary[f"{pre}_val_loss"] = s.get("val_loss", "") if s else ""
         summary[f"{pre}_lr"] = s.get("lr", "") if s else ""
+        # ALL THREE metrics at this checkpoint, not just the one that selected it — this is what
+        # makes the "policy x metric" table possible (does the LiDAR-selected checkpoint also have
+        # a high RankMe?), and what aggregate_runs.py averages over seeds.
+        at = dict(s.get("other_metrics", {})) if s else {}
+        if s:
+            at[key] = s.get("metric_value", math.nan)
+        for m in METRICS:
+            summary[f"{pre}_at_{m}"] = at.get(m, "")
+        summary[f"{pre}_areq_r2"] = (s.get("areq_fit") or {}).get("r2", "") if s else ""
+        summary[f"{pre}_metric_se"] = (s.get("rule") or {}).get("metric_se", "") if s else ""
     return summary
 
 
@@ -205,17 +263,45 @@ def append_summary(summary_path: str, row: dict) -> None:
         w.writerows(existing)
 
 
+def _write_agreement_figure(run_dir: str) -> None:
+    """The picture behind report items [2]-[4]: the three selection-score curves with the epoch each
+    rule picked, plus the rank scatters the printed Spearman rho is computed from. Plotting must
+    never break a report, so a failure here is a warning."""
+    try:
+        import pandas as pd
+
+        from braintumor_ssl.visualize import save_metric_agreement
+        rows = load_metrics_csv(os.path.join(run_dir, "metrics.csv"))
+        if not rows:
+            return
+        sels = {k: load_selection(run_dir, f) for k, (f, _, _) in METRICS.items()}
+        selected = {k: (int(s["epoch"]) if s and s.get("epoch") is not None else None)
+                    for k, s in sels.items()}
+        name = os.path.basename(os.path.normpath(run_dir))
+        out = os.path.join(run_dir, "metric_agreement.png")
+        save_metric_agreement(pd.DataFrame(rows), out, selected=selected,
+                              title=f"Label-free metric agreement — {name}")
+        print(f"    figure -> {out}")
+    except Exception as e:                       # never let a plot failure kill the report
+        print(f"    [warn] metric_agreement.png not written: {e}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Per-run RankMe/LiDAR/alpha-ReQ checkpoint-selection report")
     ap.add_argument("--run", nargs="+", required=True, help="run directory/-ies (each holds metrics.csv + best*.pth)")
     ap.add_argument("--summary", default="results/checkpoint_selection_summary.csv",
                     help="filterable cross-run summary CSV to append to")
+    ap.add_argument("--no_figure", action="store_true",
+                    help="skip <run>/metric_agreement.png (the visual form of items 2-4)")
     args = ap.parse_args()
 
     for run_dir in args.run:
         summary = report_run(run_dir)
         append_summary(args.summary, summary)
-        print(f"\n[6] appended summary row -> {args.summary}\n")
+        print(f"\n[6] appended summary row -> {args.summary}")
+        if not args.no_figure:
+            _write_agreement_figure(run_dir)
+        print()
 
 
 if __name__ == "__main__":

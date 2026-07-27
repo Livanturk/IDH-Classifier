@@ -194,27 +194,72 @@ def participation_ratio(Z: torch.Tensor) -> float:
     return float((ev.sum() ** 2) / (ev.pow(2).sum() + 1e-12))
 
 
-def alpha_req(Z: torch.Tensor, eps: float = 1e-12) -> float:
-    """alpha-ReQ (Agrawal et al. 2022): power-law decay exponent of the covariance eigenspectrum.
+def eigenspectrum(Z: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """Non-degenerate eigenvalues of the centered feature covariance, descending.
 
-    Fits  lambda_i ~ i^{-alpha}  in log-log space by least squares and returns alpha. An alpha near
-    1 (a '1/f'-like spectrum) empirically coincides with the best downstream transfer; alpha >> 1
-    is a steep spectrum (a few dominant directions -> approaching dimensional collapse); alpha << 1
-    is an over-flat spectrum. Complements RankMe: RankMe is the entropy-based EFFECTIVE COUNT of the
-    used directions, alpha-ReQ is the RATE at which per-direction variance decays -- two independent
-    readouts of the SAME eigenspectrum, so their agreement is convergent evidence.
+    lambda = s^2 of the centered matrix (SVD, not eigvalsh — robust when N << d). The numerical-zero
+    tail is dropped with a RELATIVE threshold, so for an (N x d) matrix with N < d the returned
+    length is at most N-1: with 200 val subjects and d=256 the covariance is structurally
+    rank-deficient and the remaining ~57 eigenvalues are exact zeros, not small numbers.
     """
     z = Z.float() - Z.float().mean(0, keepdim=True)
     ev = _svdvals(z).pow(2)
-    ev = ev[ev > eps * ev[0]]                       # drop the numerical-zero tail (avoid log 0)
-    k = ev.shape[0]
+    return ev[ev > eps * ev[0]]
+
+
+def alpha_req_fit(Z: torch.Tensor, k_min: int = 1, k_max_frac: float = 1.0,
+                  eps: float = 1e-12) -> dict:
+    """alpha-ReQ (Agrawal et al. 2022) with its fit diagnostics.
+
+    Fits  lambda_i ~ i^{-alpha}  by OLS in log-log space and returns alpha together with the
+    goodness of fit. An alpha near 1 (a '1/f'-like spectrum) empirically coincides with the best
+    downstream transfer; alpha >> 1 is a steep spectrum (a few dominant directions -> approaching
+    dimensional collapse); alpha << 1 is over-flat. Complements RankMe: RankMe is the entropy-based
+    EFFECTIVE COUNT of the used directions, alpha-ReQ is the RATE at which per-direction variance
+    decays -- two readouts of the SAME eigenspectrum, so their agreement is convergent, not
+    independent, evidence.
+
+    alpha alone is not interpretable: if the spectrum is not a power law the slope is still defined
+    but meaningless, so `r2` (and `se`, the slope's standard error) must be reported with it and can
+    gate selection. The fit window is explicit for the same reason -- in the N < d regime the
+    smallest sample eigenvalues are biased DOWN, which steepens the slope and inflates alpha:
+
+      k_min       1-indexed first eigenvalue to fit (drop the few dominant head directions that
+                  typically deviate from the power law).
+      k_max_frac  keep only the leading fraction of the non-degenerate spectrum (drop the noisy,
+                  downward-biased tail).
+
+    Defaults fit the whole non-degenerate spectrum, i.e. the plain alpha-ReQ estimator; pick the
+    window from scree plots ONCE and keep it fixed across every epoch, run and backbone.
+    """
+    ev = eigenspectrum(Z, eps=eps)
+    k_all = int(ev.shape[0])
+    lo = max(1, int(k_min)) - 1                              # -> 0-indexed, inclusive
+    hi = min(k_all, max(lo + 1, int(round(k_all * float(k_max_frac)))))   # exclusive
+    seg = ev[lo:hi]
+    k = int(seg.shape[0])
+    nan = float("nan")
     if k < 3:
-        return float("nan")
-    x = torch.arange(1, k + 1, dtype=torch.float64).log()
-    y = ev.double().log()
+        return {"alpha": nan, "r2": nan, "se": nan, "k_used": k, "k_lo": lo + 1, "k_hi": hi,
+                "k_available": k_all}
+
+    x = torch.arange(lo + 1, hi + 1, dtype=torch.float64).log()
+    y = seg.double().log()
     xm, ym = x.mean(), y.mean()
-    slope = ((x - xm) * (y - ym)).sum() / (((x - xm) ** 2).sum() + eps)
-    return float(-slope)
+    sxx = ((x - xm) ** 2).sum()
+    slope = ((x - xm) * (y - ym)).sum() / (sxx + eps)
+    resid = y - (ym + slope * (x - xm))
+    sse = float((resid ** 2).sum())
+    sst = float(((y - ym) ** 2).sum())
+    r2 = 1.0 - sse / sst if sst > 0 else nan
+    se = float(math.sqrt(sse / (k - 2) / float(sxx))) if k > 2 and sxx > 0 else nan
+    return {"alpha": float(-slope), "r2": float(r2), "se": se, "k_used": k,
+            "k_lo": lo + 1, "k_hi": hi, "k_available": k_all}
+
+
+def alpha_req(Z: torch.Tensor, eps: float = 1e-12) -> float:
+    """alpha-ReQ exponent only (back-compat wrapper over `alpha_req_fit`, full-spectrum window)."""
+    return alpha_req_fit(Z, eps=eps)["alpha"]
 
 
 def lidar(*views: torch.Tensor, delta: float = 1e-3, eps: float = 1e-7) -> float:
@@ -274,6 +319,38 @@ def jackknife_ci(metric_fn, *tensors: torch.Tensor,
     se = math.sqrt((n - 1) / n * float(((loo_t - loo_t.mean()) ** 2).sum()))
     z = 1.959963984540054 if abs(alpha - 0.05) < 1e-9 else _z_for_alpha(alpha)
     return theta_full - z * se, theta_full + z * se
+
+
+def delete_d_jackknife_se(metric_fn, *tensors: torch.Tensor, drop_frac: float = 0.1,
+                          reps: int = 25, seed: int = 0) -> float:
+    """Standard error of a label-free metric over subjects, by delete-d jackknife.
+
+    Same reasoning as `jackknife_ci` (never the ordinary bootstrap: duplicated rows are linearly
+    dependent and bias every rank statistic downward), but it deletes d = drop_frac*n subjects at a
+    time over `reps` random subsets instead of doing all n leave-one-out folds. That matters here
+    because this runs EVERY epoch inside training and LiDAR costs two 256x256 eigendecompositions
+    per replicate — n=200 LOO folds would be ~10x this for no extra information.
+
+        SE = sqrt( (n-d) / (d * reps) * sum_s (theta_s - mean(theta_s))^2 )        [Efron&Tibshirani1993]
+
+    Deterministic for a given `seed`, so a rerun reproduces the same threshold. Returns nan if the
+    metric is not finite on the subsets (e.g. alpha-ReQ on a spectrum too short to fit).
+    """
+    n = int(tensors[0].shape[0])
+    d = max(1, int(round(n * float(drop_frac))))
+    if n - d < 3 or reps < 2:
+        return float("nan")
+    g = torch.Generator().manual_seed(int(seed))
+    vals = []
+    for _ in range(int(reps)):
+        keep = torch.randperm(n, generator=g)[: n - d]
+        v = float(metric_fn(*[t[keep] for t in tensors]))
+        if math.isfinite(v):
+            vals.append(v)
+    if len(vals) < 2:
+        return float("nan")
+    t = torch.tensor(vals, dtype=torch.float64)
+    return float(math.sqrt((n - d) / (d * len(vals)) * float(((t - t.mean()) ** 2).sum())))
 
 
 def _z_for_alpha(alpha: float) -> float:

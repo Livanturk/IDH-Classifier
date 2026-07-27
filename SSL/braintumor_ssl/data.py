@@ -66,28 +66,86 @@ def scan_subjects(data_root: str) -> list[dict]:
     return sorted(uniq.values(), key=lambda r: r["id"])
 
 
+def _stratified_val_ids(kept: list[dict], n_val: int, rng) -> set:
+    """Pick n_val indices of `kept`, allocated across collections in proportion to their size.
+
+    Largest-remainder apportionment: each collection gets floor(share), then the leftover seats go
+    to the largest fractional remainders. The val cohort is where every label-free spectral metric
+    is measured, so its site/scanner mix has to mirror the pretraining pool — a plain uniform draw
+    would let the biggest collection dominate the eigenspectrum.
+    """
+    by_col: dict[str, list[int]] = {}
+    for i, r in enumerate(kept):
+        by_col.setdefault(r["collection"], []).append(i)
+
+    share = {c: len(ix) * n_val / len(kept) for c, ix in by_col.items()}
+    alloc = {c: min(int(s), len(by_col[c])) for c, s in share.items()}
+    # leftover seats -> largest fractional remainder first (ties broken by name for determinism)
+    order = sorted(share, key=lambda c: (-(share[c] - int(share[c])), c))
+    left = n_val - sum(alloc.values())
+    for c in order * 2:                                  # 2 passes always suffice
+        if left <= 0:
+            break
+        if alloc[c] < len(by_col[c]):
+            alloc[c] += 1
+            left -= 1
+
+    val_ids: set = set()
+    for c in sorted(by_col):                             # sorted -> draw order independent of dict order
+        ix = np.asarray(by_col[c])
+        pick = rng.permutation(len(ix))[: alloc[c]]
+        val_ids.update(ix[pick].tolist())
+    return val_ids
+
+
 def build_splits(
     records: list[dict],
     val_frac: float = 0.05,
     seed: int = 42,
     exclude_collections: Optional[list[str]] = None,
+    val_n: Optional[int] = None,
+    stratify: bool = False,
 ) -> dict:
-    """Subject-level train/val split (val is only for collapse/loss monitoring)."""
+    """Subject-level train/val split.
+
+    `val_n` (absolute subject count) overrides `val_frac` when given; `stratify` draws the val
+    cohort proportionally per collection instead of uniformly at random. Both exist because val is
+    no longer just loss/collapse monitoring — RankMe / LiDAR / alpha-ReQ are estimated from its
+    256-d feature covariance, and both the size and the composition of that cohort enter the
+    estimate (see CHECKPOINT_SELECTION_METHODOLOGY.md).
+    """
     exclude = set(exclude_collections or [])
     kept = [r for r in records if r["collection"] not in exclude]
     rng = np.random.default_rng(seed)
-    idx = rng.permutation(len(kept))
-    n_val = max(1, int(round(len(kept) * val_frac)))
-    val_ids = set(idx[:n_val].tolist())
-    train = [kept[i] for i in idx[n_val:]]
-    val = [kept[i] for i in idx[:n_val]]
+    n_val = int(val_n) if val_n else max(1, int(round(len(kept) * val_frac)))
+    n_val = max(1, min(n_val, len(kept) - 1))
+
+    if stratify:
+        val_ids = _stratified_val_ids(kept, n_val, rng)
+        val = [kept[i] for i in sorted(val_ids)]
+        train = [kept[i] for i in range(len(kept)) if i not in val_ids]
+    else:
+        idx = rng.permutation(len(kept))
+        train = [kept[i] for i in idx[n_val:]]
+        val = [kept[i] for i in idx[:n_val]]
+
+    def _by_col(rs):
+        out: dict[str, int] = {}
+        for r in rs:
+            out[r["collection"]] = out.get(r["collection"], 0) + 1
+        return dict(sorted(out.items()))
+
     return {
         "seed": seed,
         "val_frac": val_frac,
+        "val_n": n_val,
+        "stratified": bool(stratify),
         "excluded_collections": sorted(exclude),
         "n_total": len(records),
         "n_train": len(train),
         "n_val": len(val),
+        "train_by_collection": _by_col(train),
+        "val_by_collection": _by_col(val),
         "train": train,
         "val": val,
     }
@@ -400,15 +458,18 @@ class BraTSViews(Dataset):
         aug_preset: str = "auto",         # standard | gentle | auto (gentle if masked)
         aug_strength: float = 1.0,        # scales clinical intensity-aug magnitude (Stage-C A0.4)
         normalize_after_crop: bool = False,  # normalize on the (masked) ROI, not the whole brain
+        n_views: int = 2,                 # augmented views per subject in mode="train"
         cache: bool = False,
     ):
         assert mode in ("train", "eval")
+        assert n_views >= 2, "mode='train' emits at least the two SSL views"
         assert crop_mode in CROP_MODES, f"crop_mode must be one of {CROP_MODES}"
         assert center_mode in ("wt_centroid", "bbox_center")
         assert aug_preset in AUG_PRESETS, f"aug_preset must be one of {AUG_PRESETS}"
         self.records = records
         self.modalities = tuple(modalities)
         self.mode = mode
+        self.n_views = int(n_views)
         self.crop_mode = crop_mode
         self.roi = tuple(roi_size)
         self.margin = int(tumor_margin)
@@ -462,15 +523,26 @@ class BraTSViews(Dataset):
         if self.mode == "eval":
             v = self._view(x, tumor, wt_mask, rng, training=False)
             return {"image": torch.as_tensor(v).float(), "id": sid}
-        v1 = torch.as_tensor(self.appearance(self._view(x, tumor, wt_mask, rng, training=True))).float()
-        v2 = torch.as_tensor(self.appearance(self._view(x, tumor, wt_mask, rng, training=True))).float()
-        return {"view1": v1, "view2": v2, "id": sid}
+        # n_views independent crop+augment passes over ONE volume read: the two SSL views are
+        # view1/view2 (the training contract, n_views=2), and LiDAR's validation loader asks for
+        # more surrogate-class samples per subject without paying a second NIfTI read.
+        out = {f"view{i + 1}": torch.as_tensor(
+                   self.appearance(self._view(x, tumor, wt_mask, rng, training=True))).float()
+               for i in range(self.n_views)}
+        out["id"] = sid
+        return out
 
 
-def make_views(records: list[dict], cfg: dict, mode: str, cache: bool = False) -> BraTSViews:
-    """Construct a BraTSViews from a config dict — keeps all crop options in sync across scripts."""
+def make_views(records: list[dict], cfg: dict, mode: str, cache: bool = False,
+               n_views: int = 2) -> BraTSViews:
+    """Construct a BraTSViews from a config dict — keeps all crop options in sync across scripts.
+
+    `n_views` stays at the 2-view training contract by default; only validation's LiDAR loader
+    raises it (see train_simsiam.validate).
+    """
     return BraTSViews(
         records,
+        n_views=n_views,
         modalities=cfg["modalities"],
         roi_size=tuple(cfg["roi_size"]),
         mode=mode,

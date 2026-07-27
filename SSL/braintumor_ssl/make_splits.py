@@ -20,6 +20,11 @@ def main() -> None:
     ap.add_argument("--data_root", default="BraTS2021/BraTS2021_TrainingSet")
     ap.add_argument("--out", default="splits/splits.json")
     ap.add_argument("--val_frac", type=float, default=0.05)
+    ap.add_argument("--val_n", type=int, default=0,
+                    help="absolute val subject count; overrides --val_frac (spectral metrics are "
+                         "estimated on val, so its size is a methodological choice, not a ratio)")
+    ap.add_argument("--stratify", action="store_true",
+                    help="draw val proportionally per collection instead of uniformly at random")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--exclude_collections", nargs="*", default=None,
                     help="collections to drop entirely, e.g. UPENN-GBM to avoid downstream leakage")
@@ -47,12 +52,17 @@ def main() -> None:
         print(f"limited to first {len(records)} subjects (smoke test)")
 
     split = build_splits(records, val_frac=args.val_frac, seed=args.seed,
-                         exclude_collections=args.exclude_collections)
+                         exclude_collections=args.exclude_collections,
+                         val_n=args.val_n or None, stratify=args.stratify)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w") as f:
         json.dump(split, f, indent=2)
     print(f"wrote {args.out}: train={split['n_train']} val={split['n_val']} "
-          f"(excluded={split['excluded_collections']})")
+          f"(excluded={split['excluded_collections']}, stratified={split['stratified']})")
+    print(f"  val cohort composition (share of each collection):")
+    for c, n in split["val_by_collection"].items():
+        tot = n + split["train_by_collection"].get(c, 0)
+        print(f"    {c:28s} {n:4d} / {tot:4d}  ({100.0 * n / tot:.1f}%)")
 
 
 if __name__ == "__main__":

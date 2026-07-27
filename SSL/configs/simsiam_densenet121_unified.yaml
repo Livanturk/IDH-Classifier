@@ -1,6 +1,6 @@
 # Paper baseline [3/3]: densenet121 | adaptive-clinical WT recipe | UNIFIED all-data cohort.
 # The three simsiam_{r18,r34,densenet121}_unified.yaml are IDENTICAL except `backbone` and `out_dir`.
-# Cohort = BraTS-others (585) + external UPENN-GBM (610) = 1195 subjects (1135 train / 60 val).
+# Cohort = BraTS-others (585) + external UPENN-GBM (610) = 1195 subjects (995 train / 200 val).
 # UCSF-PDGM is DELIBERATELY EXCLUDED from ALL encoder-side steps (training / validation / checkpoint
 # selection / early stopping / hyperparameter tuning) — it is reserved as a held-out EXTERNAL set for
 # the later downstream evaluation only (see CHECKPOINT_SELECTION_METHODOLOGY.md, lessons L15).
@@ -10,7 +10,8 @@
 
 # ----- data -----
 data_root: data_unified
-splits_file: splits/splits_pretrain_noucsf_all.json   # 1195 subjects, NO UCSF (1135 train / 60 val)
+splits_file: splits/splits_pretrain_noucsf_v200.json  # 1195 subjects, NO UCSF (995 train / 200 val,
+                                                     #   val drawn proportionally per collection)
 modalities: [t1, t1ce, t2, flair]
 roi_size: [128, 128, 128]
 crop_mode: tumor
@@ -20,7 +21,10 @@ mask_out_non_tumor: true
 clip_percentiles: [0.5, 99.5]
 aug_preset: clinical
 normalize_after_crop: true
-num_workers: 4  # 4 simultaneous GPU jobs share gzip-compressed NIfTI files on NFS; avoid I/O bursts
+num_workers: 4
+val_num_workers: 10        # validation loads ~2400 volumes/epoch (200 subj x precise-BN + eval
+                           #   + 8 LiDAR views); at the old 2-worker cap it cost MORE than the
+                           #   training epoch. sbatch allocates 12 CPUs/task.  # 4 simultaneous GPU jobs share gzip-compressed NIfTI files on NFS; avoid I/O bursts
 cache_rate: 0.0
 
 # ----- model -----
@@ -51,13 +55,43 @@ resume: null
 
 # ----- label-free validation monitoring -----
 val_every: 1                 # validate every epoch; logs RankMe + LiDAR + alpha-ReQ each epoch
-min_delta_rankme: 0.05        # per-metric improvement thresholds for the 3 best checkpoints
+# Selection rule. A single epoch's metric is a noisy estimate over the val subjects: at n=200
+# RankMe's sampling SE is ~0.5, i.e. TEN TIMES the min_delta_rankme below, so an argmax over raw
+# per-epoch values selects noise. Two fixes, both on by default here:
+#   1. the score is a trailing mean over the last `select_smooth_window` eligible evals (causal, so
+#      it works online; the saved weights sit at the window's end, inside the plateau);
+#   2. a new best must beat the old one by `select_se_mult` x that metric's own delete-d jackknife
+#      SE over subjects (the 1-SE rule) — a data-driven threshold instead of a hand-set constant.
+# min_delta_* below survive only as a FLOOR under the SE threshold.
+# NOTE the interaction with `patience`: a real but slow improvement now needs longer to clear the
+# bar, so patience was raised 15 -> 25 to keep a slow riser from being read as a plateau.
+select_smooth_window: 5
+select_se_mult: 1.0
+select_se_reps: 25            # delete-d jackknife replicates per metric per epoch (~2 s total)
+select_se_drop_frac: 0.1      # each replicate drops 10% of the val subjects
+min_delta_rankme: 0.05        # floors only (the SE threshold above normally dominates)
 min_delta_lidar: 0.05
+# LiDAR surrogate-class views per subject. Its within-subject scatter has n*(A-1) degrees of
+# freedom for a d x d matrix: A=2 gives 200 < d=256 (degenerate, the ridge carries the estimate),
+# A=8 gives 1400 = 5.5*d. The extra views are crop+augment passes over ONE volume read, so the
+# cost is ~+20-30% wall time per run, not 4x. Drop to 4 (600 dof) if that budget is tight.
+lidar_views: 8
 min_delta_areq: 0.005         # alpha-ReQ best = min |alpha-1| (epoch closest to 1.0)
+# alpha-ReQ fit window + fit-quality floor. With N=200 val subjects < d=256 the smallest sample
+# eigenvalues are biased DOWN, which steepens the log-log slope and inflates alpha; fitting only
+# the leading 30% of the non-degenerate spectrum removes most of that bias. Calibrated on
+# synthetic power-law spectra (worst-case |bias| 0.06 over alpha in [1.0, 2.7], SD 0.013; the
+# full-spectrum window gives +0.47 at alpha=2.7). Keep FIXED across every epoch/run/backbone.
+areq_k_min: 1                 # 1-indexed first eigenvalue fitted (head is the best-estimated part)
+areq_k_max_frac: 0.30         # fit lambda_1..lambda_ceil(0.30*k) only; drop the noisy tail
+areq_r2_min: 0.95             # epochs whose power-law fit is worse than this cannot win bestA-ReQ
+                              #   (true power law scores >=0.996 here; a non-power-law control 0.76)
+dump_val_features: true       # <out_dir>/val_features/ep####.npz (~0.6 MB/epoch) -> every spectral
+                              #   quantity is recomputable post-hoc without retraining
 best_val_loss_max: -0.8
 best_align_max: 0.15
 early_stop: true
-patience: 15
+patience: 25
 min_epochs: 50
 collapse_stop: true
 collapse_patience: 3

@@ -1,0 +1,10 @@
+[watch] 2026-07-27T14:44:01+03:00 watching 9 run(s), poll 300s
+  checkpoints/simsiam_r18_unified_seed42
+  checkpoints/simsiam_r18_unified_seed43
+  checkpoints/simsiam_r18_unified_seed44
+  checkpoints/simsiam_r34_unified_seed42
+  checkpoints/simsiam_r34_unified_seed43
+  checkpoints/simsiam_r34_unified_seed44
+  checkpoints/simsiam_densenet121_unified_seed42
+  checkpoints/simsiam_densenet121_unified_seed43
+  checkpoints/simsiam_densenet121_unified_seed44

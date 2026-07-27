@@ -266,5 +266,54 @@ checkpoint'ten okunur). RankMe birincil KALIR; LiDAR bağımsız kontrol, α-ReQ
 önceden-tanımlı kural + kapı + plato + kararı etikete/harici-UCSF'e erteleme ile sınırla.
 **Kaynak.** [Garrido2023], [Thilak2024], [Agrawal2022], [[paper-scope]], `CHECKPOINT_SELECTION_METHODOLOGY.md`.
 
+## L18 — Metrikler ölçülebilir olmadan seçilemez: val n, α fit penceresi, LiDAR view sayısı (2026-07-27)
+
+**Bağlam.** L17 üç metrik için üç checkpoint tanımladı ama üçünün de **ölçüm tabanı** sorgulanmamıştı:
+val kohortu 60 denek, feature boyutu 256, LiDAR denek başına 2 view, α tüm spektruma fit ediliyordu.
+
+**Ders.** Sentetik (gerçek spektrumu bilinen) kalibrasyonla ölçüldü:
+1. **RankMe aşağı yanlı, n ile düzelir.** Gerçek 23.9 → n=60'ta 13.2, n=200'de 19.8. Tavan (min(N,d))
+   hiç bağlayıcı değildi; sorun tavan değil **yanlılık**. Val 60 → 200 (995/200, collection-stratifiye).
+2. **α'nın yanlılığı n ile DÜZELMEZ, pencereyle düzelir.** Tüm spektrumu fit etmek n=200'de n=60'tan
+   daha kötü (n<d rejiminde kuyruk aşağı yanlı → eğim dikleşir). `k_min=1, k_max_frac=0.30` en kötü
+   |bias|'ı 0.21'den 0.055'e indiriyor. **Baştan atmak (k_min>1) yanlılığı artırır** — baş en iyi
+   tahmin edilen kısımdır, sezginin tersi. n=200'ün α'ya katkısı varyanstır (SD 0.09 → 0.01).
+3. **α asla R²'siz raporlanmaz.** OLS eğimi her spektrum için tanımlıdır; power-law tutmuyorsa α
+   anlamsızdır. `areq_r2_min: 0.95` (gerçek power-law ≥0.996, power-law olmayan kontrol 0.76).
+4. **LiDAR A=2 boyutun altında.** Within-subject scatter dof = n(A−1) = 200 < d=256. A=8 → 1400 = 5.5·d.
+   Ek view'lar tek hacim okumasından türer (`BraTSViews.n_views`), maliyet ~%20–30, 4× değil.
+5. **Her epoch val feature dump'ı** (`val_features/ep####.npz`) — yukarıdaki kararların hepsi post-hoc
+   revize edilebilir hâle gelir. Bunu yapmadan her metodolojik seçimi run başlamadan doğru vermek
+   zorundasın; yaparak hiçbirini vermek zorunda değilsin. **Yeni ölçüm eklerken önce dump'ı ekle.**
+
+**Sonuç.** Eski (n=60/99) run'ların RankMe/α değerleri yenilerle karşılaştırılamaz — hepsi yeniden koşulacak.
+**Kaynak.** `CHECKPOINT_SELECTION_METHODOLOGY.md` §6, [[paper-scope]], L17.
+
+## L19 — Seçim kuralı: eşik veriden gelmeli, ve raporlanacak şey seçimin kararlılığı (2026-07-27)
+
+**Bağlam.** L18 metrikleri ölçülebilir yaptı; geriye o ölçümlerden karar üretme kuralı kaldı.
+Eski kural: ham per-epoch değerin argmax'ı + elle yazılmış `min_delta_*`.
+
+**Ders.**
+1. **Sabit eşik gürültünün onda biriydi.** n=200'de RankMe'nin denekler üzerindeki örnekleme SE'si
+   ≈0.5; `min_delta_rankme` 0.05. Yani "iyileşme eşiği" diye konan sayı fiilen eşiksiz argmax
+   demekti. Eşik **veriden** gelmeli: delete-d jackknife SE + 1-SE kuralı (`select_se_mult`).
+   Sabitleri elle kalibre etme — kalibre edilebilir bir istatistik varsa onu kullan.
+2. **Yumuşatma nedensel olabilir.** Trailing-mean online checkpoint kaydıyla uyumlu; "post-hoc
+   seçim gerekir" diye düşünmeye gerek yok. Kaydedilen ağırlıklar pencerenin sonunda = plato içinde.
+3. **Eşiği sıkılaştırınca `patience`'ı da büyüt.** Yavaş ama gerçek bir yükseliş artık eşiği geç
+   geçer; patience sabit kalırsa plato sanılıp erken durdurulur (15 → 25).
+4. **Raporlanacak büyüklük metrik değil SEÇİM.** İddia bir seçim hakkındaysa kararlı olması gereken
+   şey seçimdir. `selection_stability.py`: alt-örneklemlerde P(aynı epoch) + kayma dağılımı.
+   Düşük P + küçük kayma = düz plato (argmax değil platoyu raporla); düşük P + büyük kayma = seçim
+   tanımlı değil, o metrik o run için kural olarak sunulamaz.
+5. **Projeksiyon kontrolü PCA ile yapılmaz.** Bir epoch'ta fit edilen PCA o epoch'un bazını diğer
+   tüm epoch'ların skoruna gömer. Sabit tohumlu rastgele ortogonal projeksiyon kullan (128 / 64).
+6. **Tek run bir iddianın birimi değil.** `aggregate_runs.py` seed'ler üzerinden ortalama ± SD verir
+   ve politikalar arası fark seed gürültüsünün içindeyse sıralama yapmayı reddeder.
+7. **Terminoloji:** "best checkpoint" değil, "RankMe-selected / LiDAR-selected / α-ReQ-selected".
+
+**Kaynak.** `CHECKPOINT_SELECTION_METHODOLOGY.md` §7, [Efron&Tibshirani1993], L18, L17.
+
 ## Kaynak etiketleri
 `MODEL_SELECTION.md` ve `DESIGN_JUSTIFICATION.md` sonundaki listeyle aynı.

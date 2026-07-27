@@ -1,4 +1,4 @@
-# Paper baseline [2/3]: resnet34 | adaptive-clinical WT recipe | UNIFIED all-data cohort.
+# Paper baseline [3/3]: densenet121 | adaptive-clinical WT recipe | UNIFIED all-data cohort.
 # The three simsiam_{r18,r34,densenet121}_unified.yaml are IDENTICAL except `backbone` and `out_dir`.
 # Cohort = BraTS-others (585) + external UPENN-GBM (610) = 1195 subjects (995 train / 200 val).
 # UCSF-PDGM is DELIBERATELY EXCLUDED from ALL encoder-side steps (training / validation / checkpoint
@@ -21,14 +21,14 @@ mask_out_non_tumor: true
 clip_percentiles: [0.5, 99.5]
 aug_preset: clinical
 normalize_after_crop: true
-num_workers: 4
-val_num_workers: 10        # validation loads ~2400 volumes/epoch (200 subj x precise-BN + eval
+num_workers: 3
+val_num_workers: 6        # validation loads ~2400 volumes/epoch (200 subj x precise-BN + eval
                            #   + 8 LiDAR views); at the old 2-worker cap it cost MORE than the
                            #   training epoch. sbatch allocates 12 CPUs/task.  # 4 simultaneous GPU jobs share gzip-compressed NIfTI files on NFS; avoid I/O bursts
 cache_rate: 0.0
 
 # ----- model -----
-backbone: resnet34               # <<< the ONLY axis that varies across the 3 baseline configs
+backbone: densenet121          # <<< the ONLY axis that varies across the 3 baseline configs
 feature_dim: 256
 proj_dim: 256
 proj_hidden_dim: 512
@@ -47,7 +47,7 @@ amp: true
 grad_clip: 1.0
 
 # ----- run (seed + out_dir overridden per run by the launcher) -----
-out_dir: checkpoints/simsiam_r34_unified
+out_dir: checkpoints/simsiam_densenet121_unified
 seed: 42
 save_every: 20
 log_every: 10

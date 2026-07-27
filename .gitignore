@@ -36,3 +36,6 @@ data_unified/
 *.md
 *.pdf
 *.ocx
+SSL/*.md
+SSL/*.pdf
+SSL/*.docx

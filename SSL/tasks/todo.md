@@ -148,9 +148,16 @@ En iyi backbone üzerinde, hepsi çok-seed + GA. Ölçüt: **RankMe yörüngesi 
 ### 2026-07-26 — UCSF çıkarımı + çok-metrikli checkpoint seçimi (kullanıcı isteği)
 - **UCSF pretraining'den TAMAMEN çıkarıldı** (encoder eğitimi/validation/checkpoint seçimi/hiperparametre/
   erken durdurma). UCSF = harici, tek-seferlik downstream doğrulama. Aktif split
-  `splits/splits_pretrain_noucsf_all.json` (data_unified − UCSF; 1135 train / 60 val, UPENN içeride).
+  `splits/splits_pretrain_noucsf_v200.json` (data_unified − UCSF; **995 train / 200 val**, collection'a
+  göre orantılı stratifiye, UPENN içeride). Val 60 → 200: üç metrik de val feature kovaryansından
+  tahmin ediliyor ve n=60'ta tahmin ciddi yanlı (lessons **L18**, METHODOLOGY §6).
 - **Validation her epoch** (`val_every: 1`); her epoch **RankMe + LiDAR + α-ReQ** + loss/LR/erken-durdurma
-  `metrics.csv`'e loglanıyor.
+  `metrics.csv`'e loglanıyor. Ayrıca her epoch: α'nın fit tanısı (`areq_r2/se/k_used`), üç metriğin
+  jackknife SE'si (`*_se_jk`) ve val feature dump'ı (`val_features/ep####.npz`).
+- **Seçim kuralı** artık yumuşatılmış + 1-SE eşikli (`select_smooth_window: 5`, `select_se_mult: 1.0`);
+  `patience` 25. Analizler: `report_run.py` (run), `aggregate_runs.py` (seed'ler üzerinden ort±SD,
+  politika × configuration), `selection_stability.py` (seçimin alt-örneklemde tekrarlanabilirliği +
+  128/64 boyut projeksiyon kontrolü). Gerekçeler: lessons **L18/L19**, METHODOLOGY §6–§7.
 - **Üç best checkpoint**: `bestRankMe.pth` (max RankMe), `bestLiDAR.pth` (max LiDAR), `bestA-ReQ.pth`
   (min|α−1|); ortak yakınsama+çöküş kapısı; her checkpoint'te `selection` provenans; `best.pth`=alias.
 - **Erken durdurma = üçü de plato** (union, metrik-başına sayaç).
