@@ -55,7 +55,7 @@ log_every: 10
 resume: null
 
 # ----- label-free validation monitoring -----
-val_every: 5
+val_every: 1
 min_delta_rankme: 0.05
 best_val_loss_max: -0.8
 best_align_max: 0.15

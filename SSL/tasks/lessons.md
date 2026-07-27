@@ -206,5 +206,65 @@ sembolik linki repo kökünde olmalı ki split'lerin data-root-göreli yolları 
 
 ---
 
+## L15 — best.pth = KNEE; etiketsiz kanıt = güvenilirlik + convergent validity (etiketli AUC YOK)
+
+**Bağlam.** best.pth "converged içinde max RankMe" (=ilk-converged) seçiyordu; kullanıcı bunu ve
+etiketli-AUC yokluğunu sorguladı.
+**Ne oldu (18-koşu analizi, `scratchpad/knee_analysis.py`).** (a) Global RankMe peak HER koşuda epoch 4
+(random-init), converged değil → gate temizliyor. (b) "converged max" = ilk-converged = **dik geçiş
+üstünde**, seed-CV %13.2 (en oynak); önünde ort. **3.15 RankMe** daha düşecek. (c) Alignment-rank
+DECOUPLING: rank kaybının **%81'i knee ÖNCESİ** ve alignment iyileşmesiyle eşleşiyor (nuisance removal =
+istenen); knee sonrası alignment ~düz ama rank hâlâ azalıyor (SimSiam'ın decorrelation'sız hafif collapse
+eğilimi). (d) last.pth'te bile z-std 0.040–0.044, PR>1 → gate tutuyor, kuyruk patolojik değil, hafif.
+**Çıkarım/Kural.** **best.pth = KNEE (plateau onset)** — dik geçiş bitmiş, stable rank'ın en yükseği.
+**D2 karşılaştırma istatistiği = plateau-mean** (knee→son; seed-CV %7, en reproducible). İkisi aynı plateau
+bölgesinde → tutarlı. R1 (peak) ve last = ablasyon.
+**SERT KISIT.** Etiketli AUC YOK → downstream-optimallik kanıtlanamaz; onun yerine (1) reliability
+(seed-CV), (2) convergent validity (bağımsız proxy uzlaşması), (3) construct validity (teori), (4) ablasyon
+(naif peak kararsız), (5) confound (r34 en çok param, en kötü). Rank→performans bağı Garrido'dan MİRAS.
+**Uygulandı.** `utils.lidar` (nuisance-whitened LDA effective rank) + `utils.alpha_req` (spektrum power-law
+eğimi) eklendi; `evaluate.py` leaderboard + lidar CI; sentetik test: LiDAR spread↔nuisance'ı ayırıyor
+(47↔35), RankMe ayıramıyor (59↔59) → LiDAR'ın RankMe'ye kattığı ek ayrım kanıtı. **Kalan:** knee-tabanlı
+best.pth kuralını `train_simsiam.py`/`select_model.py`'de kodla; `MODEL_SELECTION.md`'yi güncelle.
+**Kaynak.** [Garrido2023], [Jing2022], [Hua2021], [Thilak2024], [Agrawal2022], [Satopää2011], [[paper-scope]].
+
+## L16 — Convergent-validity GERÇEK sonucu: "densenet kazanır" robust, tam 3'lü sıra DEĞİL
+
+**Bağlam.** LiDAR+α-ReQ'i 18 last.pth'te (val n=99) hesapladık (embedding tabanlı), backbone-sırası uzlaşmasını
+test ettik. Doğru yönler: rankme↑, lidar↑, **alpha_req↓** (α≈1 ideal; rejimimizde α>>1 → düşük iyi), uniformity↓, PR↑.
+**Ne oldu (per-backbone, 6'şar koşu).** rankme: D 9.22 > R18 6.08 > R34 4.95 (temiz). alpha_req: R18 2.62 ≈ D 2.74 <
+R34 3.01 (R34 net en kötü, D≈R18 berabere). lidar: D 3.06 / R18 2.69 / R34 2.90 — **aşırı örtüşen, gürültülü,
+sonuç çıkmıyor** (n=99 ≪ d=256 → Σ_b rank-eksik). uniformity/PR plateau'da dejenere.
+**Çıkarım/Kural.** **ROBUST iddia = "DenseNet-121 kazanan"** (her metrikte en iyi ya da berabere; RankMe'de net) +
+**"R34 üst-lig değil"** (RankMe & α-ReQ ikisi de R34'ü sona koyuyor → anti-'bigger is better'). **Tam 3'lü sıra
+(D>R18>R34) SADECE RankMe'ye dayanır** — α-ReQ D≈R18 der. Paper'da "tüm metrikler tam sırayı verdi" DEME; "densenet
+kazanır (çok-metrik) + tam sıra RankMe-birincil" de. **LiDAR'ı limitasyon** olarak raporla veya n'i büyüt (etiketsiz →
+train denekleri de eklenebilir, leakage yok; n~500+ hedefle). Not: eski-18 verisi; unified'da tazelenecek.
+**Uygulandı.** `convergence_analysis.py` alpha_req yönü -1'e düzeltildi. **Kalan:** docx §6.1'i bu dürüst sonuçla
+güncelle; LiDAR'ı büyük-n ile yeniden hesapla; workflow/figürlerdeki "densenet>r18>r34"ü "densenet kazanır"a yumuşat.
+**Kaynak.** [Garrido2023], [Thilak2024], [Agrawal2022], [[paper-scope]].
+
+## L17 — UCSF pretraining'den ÇIKARILDI + çok-metrikli checkpoint seçimi (2026-07-26, kullanıcı; L14'ü kısmen ezer)
+**Bağlam.** Kullanıcı kararı: UCSF-PDGM encoder-tarafı HİÇBİR adımda kullanılmaz (eğitim / validation /
+checkpoint seçimi / hiperparametre / erken durdurma). UCSF = harici, tercihen tek-seferlik downstream
+doğrulama seti. L14'teki "tek kohort, TÜM veri (UCSF dahil)" kararı bu yönüyle GEÇERSİZ.
+**Uygulandı.**
+- Yeni split `splits/splits_pretrain_noucsf_all.json` = data_unified − UCSF (1135 train / 60 val).
+  `make_splits` artık exclude'u `--limit`'ten ÖNCE uygular; smoke da UCSF'siz; `smoke_unified.json` silindi.
+- 3 `*_unified.yaml` → yeni split + `val_every: 1`; `*_withucsf.yaml` DEPRECATED banner'lı.
+- `train_simsiam`: `validate()` artık her epoch RankMe + **LiDAR** + **α-ReQ** hesaplar; **üç ayrı best**
+  (`bestRankMe/bestLiDAR/bestA-ReQ.pth`) ortak yakınsama+çöküş kapısıyla; her checkpoint'te `selection`
+  provenans bloğu; `best.pth` = bestRankMe alias. **α-ReQ best = min |α−1|** (1'e en yakın, Agrawal2022),
+  L16'daki "convergence_analysis'te düşük-α=iyi" yönüyle KARIŞTIRMA (o yön yüksek-α rejimi için sıralama içindi).
+- **Erken durdurma = ÜÇÜ DE plato** (union; her metriğin ayrı `no_improve` sayacı) → hiçbir best checkpoint
+  hâlâ tırmanırken kesilmez. metrics.csv'e lidar/alpha_req/lr/no_improve_*/stopped/stop_reason eklendi.
+- Yeni: `report_run.py` (run-başına 6-maddelik karşılaştırma + filtrelenebilir `checkpoint_selection_summary.csv`),
+  `downstream_ablation.py` (3-checkpoint transfer iskelesi; label stub; UCSF yalnız `--external` final),
+  `CHECKPOINT_SELECTION_METHODOLOGY.md`, `scripts/pretrain_unified_noucsf.sh` (backbone × seed).
+**Kural.** DenseNet121/seed42 yalnız ÖRNEK — tüm mimari/config/seed'lerde genellenebilir uygula (cfg
+checkpoint'ten okunur). RankMe birincil KALIR; LiDAR bağımsız kontrol, α-ReQ spektrum-şekli. Selection-bias'ı
+önceden-tanımlı kural + kapı + plato + kararı etikete/harici-UCSF'e erteleme ile sınırla.
+**Kaynak.** [Garrido2023], [Thilak2024], [Agrawal2022], [[paper-scope]], `CHECKPOINT_SELECTION_METHODOLOGY.md`.
+
 ## Kaynak etiketleri
 `MODEL_SELECTION.md` ve `DESIGN_JUSTIFICATION.md` sonundaki listeyle aynı.

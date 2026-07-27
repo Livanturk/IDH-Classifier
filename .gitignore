@@ -32,3 +32,7 @@ commands.txt
 # unified dataset (symlinks to ignored data)
 SSL/data_unified/
 data_unified/
+
+*.md
+*.pdf
+*.ocx

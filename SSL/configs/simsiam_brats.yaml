@@ -48,7 +48,7 @@ resume: null              # path to checkpoint to resume from
 # participation / alignment / uniformity), appends metrics.csv, and saves best.pth by RankMe
 # *among converged epochs*. It never changes the training trajectory or last.pth. early_stop /
 # collapse_stop are opt-in.
-val_every: 10             # 0 = off; the reference recipe uses 1 (see simsiam_r18_adaptive_clinical.yaml)
+val_every: 1             # 0 = off; validate every epoch (RankMe + LiDAR + alpha-ReQ)
 min_delta_rankme: 0.05    # min RankMe gain that counts as an improvement (best.pth / patience)
 best_val_loss_max: -0.8   # best.pth convergence gate: eligible only if val_loss <= this ...
 best_align_max: 0.15      # ... AND alignment <= this (RankMe peaks at random init; this blocks it)

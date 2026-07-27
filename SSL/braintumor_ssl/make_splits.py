@@ -34,6 +34,14 @@ def main() -> None:
     for c, n in sorted(by_col.items()):
         print(f"  {c:28s} {n}")
 
+    # Drop excluded collections BEFORE --limit so `--limit N --exclude_collections X` yields N
+    # subjects that are all non-X (build_splits re-applies the same exclusion; it is idempotent).
+    if args.exclude_collections:
+        ex = set(args.exclude_collections)
+        before = len(records)
+        records = [r for r in records if r["collection"] not in ex]
+        print(f"excluded {before - len(records)} subjects from collections {sorted(ex)}")
+
     if args.limit:
         records = records[: args.limit]
         print(f"limited to first {len(records)} subjects (smoke test)")

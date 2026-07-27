@@ -1,3 +1,8 @@
+# ============================================================================
+# DEPRECATED (2026-07-26): the +UCSF data-cohort ablation was REMOVED. UCSF-PDGM must not
+# enter any encoder-side step; it is reserved as a held-out EXTERNAL downstream set. Do NOT
+# launch this config. Kept only for provenance. See CHECKPOINT_SELECTION_METHODOLOGY.md / L15.
+# ============================================================================
 # Data-cohort ablation: resnet18 + UCSF-PDGM ADDED to pretraining.
 # Identical to configs/simsiam_densenet121_noucsf.yaml EXCEPT the split: here UCSF is added to the
 # TRAIN set (val is the SAME 99 non-UCSF subjects, so both encoders are judged on an identical

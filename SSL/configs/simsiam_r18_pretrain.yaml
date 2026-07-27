@@ -50,7 +50,7 @@ log_every: 10
 resume: null
 
 # ----- label-free validation monitoring -----
-val_every: 5                     # validate + save best.pth every 5 epochs
+val_every: 1                     # validate every epoch; logs RankMe + LiDAR + alpha-ReQ
 min_delta_rankme: 0.05
 # best.pth = highest RankMe *among converged* epochs. The gate below blocks the trap where RankMe
 # is highest at random init (untrained scatter inflates effective rank) — without it best.pth

@@ -26,7 +26,9 @@ from braintumor_ssl.tracking import Tracker
 from braintumor_ssl.utils import (
     AverageMeter,
     alignment,
+    alpha_req,
     cosine_lr,
+    lidar,
     participation_ratio,
     rankme,
     recompute_bn_stats,
@@ -196,16 +198,22 @@ def validate(model: SimSiam, val_records: list, cfg: dict, device: str, use_amp:
             out = model(x1, x2)
             loss = simsiam_loss(out)
         losses.append(float(loss.item()))
-        h1s.append(out["h1"].float().cpu())
-        h2s.append(out["h2"].float().cpu())
+        h1s.append(out["h1"].float().cpu())     # 256-d encoder features, view 1 (paired w/ h2)
+        h2s.append(out["h2"].float().cpu())     # 256-d encoder features, view 2
     h1, h2 = torch.cat(h1s), torch.cat(h2s)
 
     if was_training:
         model.train()
+    # The three checkpoint-selection metrics are all computed here every epoch:
+    #   rankme    — effective rank of the single (eval) view features (want HIGH)
+    #   lidar     — augmentation-invariant rank from the two paired views (want HIGH)
+    #   alpha_req — power-law decay exponent of the eval-view spectrum (want CLOSE TO 1)
     return {
         "val_loss": float(sum(losses) / len(losses)) if losses else float("nan"),
         "z_std": representation_std(feats),
         "rankme": rankme(feats),
+        "lidar": lidar(h1, h2),
+        "alpha_req": alpha_req(feats),
         "participation_ratio": participation_ratio(feats),
         "alignment": alignment(h1, h2),
         "uniformity": uniformity(feats),
@@ -240,8 +248,47 @@ def is_converged(m: dict, cfg: dict) -> bool:
     max-RankMe rule saves an early, essentially-untrained epoch as best.pth. Convergence is read
     from the SSL loss itself: val_loss near -1 (negative-cosine floor) and low alignment (the two
     views actually map together) both signal genuine learning, not random spread."""
+    if cfg.get("smoke"):
+        return True                          # smoke exercises the save paths; 2 epochs never "converge"
     return (m["val_loss"] <= cfg.get("best_val_loss_max", -0.8)
             and m["alignment"] <= cfg.get("best_align_max", 0.15))
+
+
+# --------------------------------------------------------------------------- #
+# Multi-metric checkpoint selection (RankMe / LiDAR / alpha-ReQ)
+# --------------------------------------------------------------------------- #
+# One best checkpoint per metric. Eligibility (converged + non-collapsed + finite) is SHARED so a
+# random-init / collapsed epoch can never win any of them (lesson L13). Improvement is expressed as a
+# single "score to MAXIMIZE" so the three read identically: RankMe/LiDAR use the value itself (higher
+# better); alpha-ReQ uses -|alpha - 1| because alpha=1 is the optimal-transfer target (Agrawal 2022),
+# so the epoch closest to 1 scores highest. `last.pth` (final plateau) stays the backbone-comparison
+# basis; these are the "which selection rule wins downstream?" options the D3 ablation will judge.
+def metric_specs(cfg: dict) -> list[dict]:
+    return [
+        {"key": "rankme", "name": "RankMe", "file": "bestRankMe.pth",
+         "score": lambda m: m["rankme"], "delta": float(cfg.get("min_delta_rankme", 0.0) or 0.0),
+         "goal": "max RankMe"},
+        {"key": "lidar", "name": "LiDAR", "file": "bestLiDAR.pth",
+         "score": lambda m: m["lidar"], "delta": float(cfg.get("min_delta_lidar", 0.0) or 0.0),
+         "goal": "max LiDAR (augmentation-invariant rank)"},
+        {"key": "alpha_req", "name": "alpha-ReQ", "file": "bestA-ReQ.pth",
+         "score": lambda m: -abs(m["alpha_req"] - 1.0),
+         "delta": float(cfg.get("min_delta_areq", 0.0) or 0.0), "goal": "alpha-ReQ closest to 1.0"},
+    ]
+
+
+def selection_record(spec: dict, epoch: int, vm: dict, train_loss: float, lr: float) -> dict:
+    """Provenance stored inside each best*.pth: which metric picked it, its value, the OTHER two
+    metrics at that epoch, the losses, the LR, and a human-readable reason."""
+    return {
+        "metric": spec["key"], "metric_name": spec["name"],
+        "metric_value": round(float(vm[spec["key"]]), 5), "goal": spec["goal"], "epoch": int(epoch),
+        "other_metrics": {k: round(float(vm[k]), 5) for k in ("rankme", "lidar", "alpha_req")
+                          if k != spec["key"]},
+        "train_loss": round(float(train_loss), 5), "val_loss": round(float(vm["val_loss"]), 5),
+        "lr": float(lr),
+        "reason": f"{spec['goal']} among converged, non-collapsed epochs (selected at epoch {epoch})",
+    }
 
 
 def write_metrics_csv(path: str, rows: list[dict]) -> None:
@@ -303,8 +350,12 @@ def main() -> None:
     warmup_steps = cfg["warmup_epochs"] * len(train_ld)
     os.makedirs(cfg["out_dir"], exist_ok=True)
 
-    # best-checkpoint / early-stop monitor state (used only when val_every > 0)
-    best_rankme, best_epoch, no_improve, collapse_run = -float("inf"), -1, 0, 0
+    # multi-metric best-checkpoint / early-stop monitor state (used only when val_every > 0).
+    # One tracker per metric: best score-so-far, the epoch that achieved it, and a plateau counter.
+    specs = metric_specs(cfg)
+    best = {s["key"]: {"score": -float("inf"), "epoch": -1, "no_improve": 0, "value": float("nan")}
+            for s in specs}
+    collapse_run = 0
     metrics_history: list[dict] = []
 
     # optional experiment tracking (MLflow -> DagsHub); no-op unless cfg['mlflow'] is true
@@ -401,59 +452,94 @@ def main() -> None:
             collapsed, why = is_collapsed(vm, th)
             converged = is_converged(vm, cfg)
             print(f"[val {epoch:03d}] loss={vm['val_loss']:+.4f} z_std={vm['z_std']:.4f} "
-                  f"rankme={vm['rankme']:.3f} pr={vm['participation_ratio']:.2f} "
-                  f"align={vm['alignment']:.4f} unif={vm['uniformity']:+.3f} "
-                  f"converged={converged} collapsed={collapsed}" + ("" if not collapsed else f" ({why})"))
-            metrics_history.append({
-                "epoch": epoch, "train_loss": round(loss_m.avg, 5), "train_z_std": round(std_m.avg, 5),
+                  f"rankme={vm['rankme']:.3f} lidar={vm['lidar']:.3f} areq={vm['alpha_req']:.3f} "
+                  f"pr={vm['participation_ratio']:.2f} align={vm['alignment']:.4f} "
+                  f"unif={vm['uniformity']:+.3f} converged={converged} collapsed={collapsed}"
+                  + ("" if not collapsed else f" ({why})"))
+            lr_now = optimizer.param_groups[0]["lr"]
+
+            # --- per-metric best-checkpoint update (shared eligibility gate; L13) ---
+            eligible = converged and (not collapsed)
+            for s in specs:
+                st = best[s["key"]]
+                raw = vm[s["key"]]
+                ok = eligible and math.isfinite(raw) and math.isfinite(s["score"](vm))
+                improved = ok and s["score"](vm) > st["score"] + s["delta"]
+                if improved:
+                    st["score"], st["epoch"], st["no_improve"], st["value"] = s["score"](vm), epoch, 0, raw
+                    sel = selection_record(s, epoch, vm, loss_m.avg, lr_now)
+                    ckpt = {"epoch": epoch, "model": model.state_dict(),
+                            "optimizer": optimizer.state_dict(), "cfg": cfg,
+                            "val_metrics": vm, "selection": sel}
+                    save_checkpoint(ckpt, os.path.join(cfg["out_dir"], s["file"]))
+                    if s["key"] == "rankme":            # back-compat alias for evaluate/select_model tooling
+                        save_checkpoint(ckpt, os.path.join(cfg["out_dir"], "best.pth"))
+                    print(f"  -> new best {s['name']}={raw:.4f} @ epoch {epoch} (saved {s['file']})")
+                elif st["epoch"] >= 0:
+                    # only count a plateau once this metric has a converged baseline to plateau from —
+                    # pre-convergence evals are "not learned yet", not "improvement stalled".
+                    st["no_improve"] += 1
+
+            # --- persist per-epoch record: 3 selection metrics + losses + LR + early-stop state ---
+            patience = cfg.get("patience", 20)
+            plateaued = {s["key"]: (best[s["key"]]["epoch"] >= 0 and best[s["key"]]["no_improve"] >= patience)
+                         for s in specs}
+            row = {
+                "epoch": epoch, "lr": round(lr_now, 6),
+                "train_loss": round(loss_m.avg, 5), "train_z_std": round(std_m.avg, 5),
                 "val_loss": round(vm["val_loss"], 5), "z_std": round(vm["z_std"], 5),
-                "rankme": round(vm["rankme"], 4), "participation_ratio": round(vm["participation_ratio"], 4),
+                "rankme": round(vm["rankme"], 4), "lidar": round(vm["lidar"], 4),
+                "alpha_req": round(vm["alpha_req"], 4),
+                "participation_ratio": round(vm["participation_ratio"], 4),
                 "alignment": round(vm["alignment"], 5), "uniformity": round(vm["uniformity"], 5),
                 "n_val": vm["n_val"], "converged": converged, "collapsed": collapsed,
-            })
-            write_metrics_csv(os.path.join(cfg["out_dir"], "metrics.csv"), metrics_history)
+                "no_improve_rankme": best["rankme"]["no_improve"],
+                "no_improve_lidar": best["lidar"]["no_improve"],
+                "no_improve_areq": best["alpha_req"]["no_improve"],
+                "stopped": False, "stop_reason": "",
+            }
             tracker.log_metrics({"val_loss": vm["val_loss"], "z_std": vm["z_std"], "rankme": vm["rankme"],
+                                 "lidar": vm["lidar"], "alpha_req": vm["alpha_req"], "lr": lr_now,
                                  "participation_ratio": vm["participation_ratio"],
                                  "alignment": vm["alignment"], "uniformity": vm["uniformity"],
                                  "converged": float(converged), "collapsed": float(collapsed)}, step=epoch)
 
-            # best.pth = highest RankMe *among converged, non-collapsed* epochs = the "max retained
-            # rank" checkpoint. The convergence gate stops it latching onto the random-init epoch.
-            # NOTE (L13): this rule = the earliest-converged epoch and its RankMe VALUE is volatile
-            # (steep transient x seed-dependent convergence timing); it is NOT the backbone-comparison
-            # basis. The comparison uses the final/plateau checkpoint (last.pth, always saved below);
-            # best.pth is kept as the high-rank option whose downstream value D3 (labels) will judge.
-            eligible = converged and (not collapsed) and math.isfinite(vm["rankme"])
-            improved = eligible and vm["rankme"] > best_rankme + cfg.get("min_delta_rankme", 0.0)
-            if improved:
-                best_rankme, best_epoch, no_improve = vm["rankme"], epoch, 0
-                save_checkpoint({"epoch": epoch, "model": model.state_dict(),
-                                 "optimizer": optimizer.state_dict(), "cfg": cfg, "val_metrics": vm},
-                                os.path.join(cfg["out_dir"], "best.pth"))
-                print(f"  -> new best RankMe={best_rankme:.3f} @ epoch {epoch} (converged; saved best.pth)")
-            elif best_epoch >= 0:
-                # only count a RankMe plateau once we have a converged baseline to plateau from —
-                # pre-convergence evals are "not learned yet", not "improvement stalled".
-                no_improve += 1
-
+            # --- stop conditions (collapse OR all three metrics plateaued) ---
+            stop_reason = ""
             collapse_run = collapse_run + 1 if collapsed else 0
             if cfg.get("collapse_stop") and collapse_run >= cfg.get("collapse_patience", 3):
-                print(f"[stop] collapse detected {collapse_run}x in a row -> stopping")
-                break
-            if cfg.get("early_stop") and (epoch + 1) >= cfg.get("min_epochs", 0) \
-                    and no_improve >= cfg.get("patience", 20):
-                print(f"[stop] RankMe plateaued for {no_improve} evals -> early stop")
+                stop_reason = f"collapse detected {collapse_run}x in a row"
+            elif cfg.get("early_stop") and (epoch + 1) >= cfg.get("min_epochs", 0) \
+                    and all(plateaued.values()):
+                # union rule: only stop once RankMe, LiDAR AND alpha-ReQ have each stalled for `patience`
+                # evals, so no per-metric best checkpoint is cut off while still improving.
+                stalls = ", ".join(f"{k}(+{best[k]['no_improve']})" for k in plateaued)
+                stop_reason = f"all metrics plateaued [{stalls}]"
+
+            if stop_reason:
+                row["stopped"], row["stop_reason"] = True, stop_reason
+            metrics_history.append(row)
+            write_metrics_csv(os.path.join(cfg["out_dir"], "metrics.csv"), metrics_history)
+            if stop_reason:
+                print(f"[stop] {stop_reason} -> stopping")
                 break
 
-    if best_epoch >= 0:
-        print(f"[best] converged, max-RankMe={best_rankme:.3f} @ epoch {best_epoch} "
-              f"-> {os.path.join(cfg['out_dir'], 'best.pth')}")
-        # record the selection outcome so DagsHub shows which epoch each run's best.pth came from
-        tracker.log_metrics({"best_epoch": float(best_epoch), "best_rankme": best_rankme})
+    any_best = any(best[s["key"]]["epoch"] >= 0 for s in specs)
+    if any_best:
+        print("[best] per-metric selected checkpoints (converged, non-collapsed):")
+        for s in specs:
+            st = best[s["key"]]
+            if st["epoch"] >= 0:
+                print(f"  {s['name']:>9s}: epoch {st['epoch']:>3d}  value={st['value']:.4f}  -> {s['file']}")
+                # record each run's per-metric selection so DagsHub shows which epoch won each rule
+                tracker.log_metrics({f"best_{s['key']}_epoch": float(st["epoch"]),
+                                     f"best_{s['key']}_value": float(st["value"])})
+            else:
+                print(f"  {s['name']:>9s}: (no eligible epoch)")
     elif val_records:
         print("[best] NO epoch passed the convergence gate "
               f"(val_loss<={cfg.get('best_val_loss_max', -0.8)}, align<={cfg.get('best_align_max', 0.15)}); "
-              "best.pth was NOT written -> use last.pth for downstream, and check that training actually "
+              "no best*.pth was written -> use last.pth for downstream, and check that training actually "
               "converged (val_loss should approach -1).")
     if metrics_history:
         try:

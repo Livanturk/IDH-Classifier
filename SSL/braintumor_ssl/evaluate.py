@@ -35,7 +35,9 @@ from braintumor_ssl.data import load_splits, make_views, scan_subjects
 from braintumor_ssl.models import SimSiam
 from braintumor_ssl.utils import (
     alignment,
+    alpha_req,
     jackknife_ci,
+    lidar,
     participation_ratio,
     rankme,
     recompute_bn_stats,
@@ -186,22 +188,27 @@ def main() -> None:
             "splits": os.path.basename(cfg.get("splits_file", "?")),
             "n": len(ids),
             "z_std": round(representation_std(H1), 4),          # collapse gate (want high)
-            "rankme": round(rankme(H1), 2),                     # want HIGH
+            "rankme": round(rankme(H1), 2),                     # want HIGH (primary)
+            "lidar": round(lidar(H1, H2), 2),                   # want HIGH (nuisance-whitened rank)
+            "alpha_req": round(alpha_req(H1), 3),               # spectrum decay; ~1 best
             "alignment": round(alignment(H1, H2), 4),           # want LOW (if not collapsed)
             "uniformity": round(uniformity(H1), 4),             # want NEGATIVE
             "particip_ratio": round(participation_ratio(H1), 2),  # want HIGH
         }
-        # jackknife 95% CIs over subjects for the ranking/tie-break metrics (D2 uses rankme CI)
+        # jackknife 95% CIs over subjects for the ranking/convergent-validity metrics (D2 uses rankme CI)
         if not args.no_ci:
             rl, rh = jackknife_ci(rankme, H1)
             pl, ph = jackknife_ci(participation_ratio, H1)
             ul, uh = jackknife_ci(uniformity, H1)
+            ll, lh = jackknife_ci(lidar, H1, H2)                # paired: same subject dropped in both views
             row.update(rankme_ci_lo=round(rl, 2), rankme_ci_hi=round(rh, 2),
                        pr_ci_lo=round(pl, 2), pr_ci_hi=round(ph, 2),
-                       unif_ci_lo=round(ul, 4), unif_ci_hi=round(uh, 4))
+                       unif_ci_lo=round(ul, 4), unif_ci_hi=round(uh, 4),
+                       lidar_ci_lo=round(ll, 2), lidar_ci_hi=round(lh, 2))
         rows.append(row)
         ci = f" [{row['rankme_ci_lo']:.2f},{row['rankme_ci_hi']:.2f}]" if not args.no_ci else ""
-        print(f"  {name:24s} rankme={row['rankme']:6.2f}{ci} align={row['alignment']:.4f} "
+        print(f"  {name:24s} rankme={row['rankme']:6.2f}{ci} lidar={row['lidar']:6.2f} "
+              f"alpha={row['alpha_req']:.2f} align={row['alignment']:.4f} "
               f"unif={row['uniformity']:+.3f} pr={row['particip_ratio']:6.2f} z_std={row['z_std']:.4f}")
 
         # persist per-config features + optional 2-D embedding
@@ -231,8 +238,9 @@ def main() -> None:
         from braintumor_ssl.tracking import Tracker
 
         result_dir = os.path.dirname(args.out) or "."
-        metric_keys = ("z_std", "rankme", "alignment", "uniformity", "particip_ratio")
-        ci_keys = ("rankme_ci_lo", "rankme_ci_hi", "pr_ci_lo", "pr_ci_hi", "unif_ci_lo", "unif_ci_hi")
+        metric_keys = ("z_std", "rankme", "lidar", "alpha_req", "alignment", "uniformity", "particip_ratio")
+        ci_keys = ("rankme_ci_lo", "rankme_ci_hi", "pr_ci_lo", "pr_ci_hi", "unif_ci_lo", "unif_ci_hi",
+                   "lidar_ci_lo", "lidar_ci_hi")
         # One MLflow run per checkpoint makes DagsHub's run comparison view useful.
         for row in rows:
             tk = Tracker(

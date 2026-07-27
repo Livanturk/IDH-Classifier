@@ -42,8 +42,8 @@ import math
 Z_STD_MIN = 0.01
 ALIGN_MAX = 0.30
 DELTA_RANKME = 0.5          # RankMe margin below which two runs are "tied" (used if no CI columns)
-_NUM = ("epoch", "z_std", "rankme", "alignment", "uniformity", "particip_ratio",
-        "rankme_ci_lo", "rankme_ci_hi")
+_NUM = ("epoch", "z_std", "rankme", "lidar", "alpha_req", "alignment", "uniformity", "particip_ratio",
+        "rankme_ci_lo", "rankme_ci_hi", "lidar_ci_lo", "lidar_ci_hi")
 
 
 def load_rows(path: str) -> list[dict]:

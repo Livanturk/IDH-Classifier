@@ -71,7 +71,10 @@ KALKTI. Önceki 18 koşu (noucsf/withucsf) artık geçersiz (yeni veriyle değil
       launcher VARIANT=unified default ✓; harici-veri smoke (tümör-crop+auto-seg+8-bit) hatasız ✓.
 - [ ] **Stage A.yeni RUN (GPU):** `NODE=ai02 bash scripts/pretrain_stageA.sh` + `NODE=ai01 bash ...`
       (VARIANT=unified default) → `COMPARE=1 bash ...`. 3 backbone × ≥3 seed = 9 koşu. Karşılaştırma = final plato (L13).
-- [ ] **LiDAR** (onaylı, gerekçelendirilecek): final checkpoint doğrulayıcı metrik.
+- [x] **LiDAR + α-ReQ implement edildi** (`utils.lidar`, `utils.alpha_req`; `evaluate.py` leaderboard'a
+      `lidar`/`alpha_req`(+lidar CI) sütunları; `select_model._NUM` genişletildi). Convergent-validity için.
+      Sentetik doğrulama: LiDAR spread↔nuisance-heavy'i ayırıyor (47↔35), RankMe ayıramıyor (59↔59) → knee
+      argümanının kanıtı. Kalan: 18 koşuda (ve unified'da) leaderboard'ı üretip üç metriğin uzlaşmasını raporla.
 - [ ] **Figürler İngilizce + 600 dpi:** trajektori, backbone bar (RankMe+LiDAR±CI), spektrum, t-SNE (batch-effect + 8/16-bit).
 
 ## Aşama A — (ESKİ, tek-seed + eski veri; referans olarak duruyor)
@@ -140,5 +143,19 @@ En iyi backbone üzerinde, hepsi çok-seed + GA. Ölçüt: **RankMe yörüngesi 
 - Tam Kartezyen grid (3×5×2×≥3) çok pahalı → **referans-etrafı OFAT + seçili etkileşim** (yukarıdaki
   aşamalar bunu uyguluyor), tam grid değil.
 
-## Review (doldurulacak)
-- _Aşamalar tamamlandıkça sonuç özeti + çıkarımlar buraya; lessons.md'ye de yansıt._
+## Review
+
+### 2026-07-26 — UCSF çıkarımı + çok-metrikli checkpoint seçimi (kullanıcı isteği)
+- **UCSF pretraining'den TAMAMEN çıkarıldı** (encoder eğitimi/validation/checkpoint seçimi/hiperparametre/
+  erken durdurma). UCSF = harici, tek-seferlik downstream doğrulama. Aktif split
+  `splits/splits_pretrain_noucsf_all.json` (data_unified − UCSF; 1135 train / 60 val, UPENN içeride).
+- **Validation her epoch** (`val_every: 1`); her epoch **RankMe + LiDAR + α-ReQ** + loss/LR/erken-durdurma
+  `metrics.csv`'e loglanıyor.
+- **Üç best checkpoint**: `bestRankMe.pth` (max RankMe), `bestLiDAR.pth` (max LiDAR), `bestA-ReQ.pth`
+  (min|α−1|); ortak yakınsama+çöküş kapısı; her checkpoint'te `selection` provenans; `best.pth`=alias.
+- **Erken durdurma = üçü de plato** (union, metrik-başına sayaç).
+- Yeni: `braintumor_ssl/report_run.py` (run-başına 6-maddelik rapor + `results/checkpoint_selection_summary.csv`),
+  `braintumor_ssl/downstream_ablation.py` (3-checkpoint transfer iskelesi; UCSF yalnız `--external` final),
+  `braintumor_ssl/CHECKPOINT_SELECTION_METHODOLOGY.md`, `scripts/pretrain_unified_noucsf.sh` (backbone×seed).
+- Genellenebilir: DenseNet121/seed42 yalnız örnek; cfg checkpoint'ten okunur. Bkz. lessons **L17**.
+- _Sonraki aşamalar tamamlandıkça sonuç özeti + çıkarımlar buraya; lessons.md'ye de yansıt._

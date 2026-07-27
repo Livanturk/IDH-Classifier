@@ -194,6 +194,58 @@ def participation_ratio(Z: torch.Tensor) -> float:
     return float((ev.sum() ** 2) / (ev.pow(2).sum() + 1e-12))
 
 
+def alpha_req(Z: torch.Tensor, eps: float = 1e-12) -> float:
+    """alpha-ReQ (Agrawal et al. 2022): power-law decay exponent of the covariance eigenspectrum.
+
+    Fits  lambda_i ~ i^{-alpha}  in log-log space by least squares and returns alpha. An alpha near
+    1 (a '1/f'-like spectrum) empirically coincides with the best downstream transfer; alpha >> 1
+    is a steep spectrum (a few dominant directions -> approaching dimensional collapse); alpha << 1
+    is an over-flat spectrum. Complements RankMe: RankMe is the entropy-based EFFECTIVE COUNT of the
+    used directions, alpha-ReQ is the RATE at which per-direction variance decays -- two independent
+    readouts of the SAME eigenspectrum, so their agreement is convergent evidence.
+    """
+    z = Z.float() - Z.float().mean(0, keepdim=True)
+    ev = _svdvals(z).pow(2)
+    ev = ev[ev > eps * ev[0]]                       # drop the numerical-zero tail (avoid log 0)
+    k = ev.shape[0]
+    if k < 3:
+        return float("nan")
+    x = torch.arange(1, k + 1, dtype=torch.float64).log()
+    y = ev.double().log()
+    xm, ym = x.mean(), y.mean()
+    slope = ((x - xm) * (y - ym)).sum() / (((x - xm) ** 2).sum() + eps)
+    return float(-slope)
+
+
+def lidar(*views: torch.Tensor, delta: float = 1e-3, eps: float = 1e-7) -> float:
+    """LiDAR (Thilak et al. 2024): effective rank of the LDA matrix built from augmentation
+    'surrogate classes'. Each subject is a class; its q augmented views are the in-class samples.
+
+        LiDAR = exp( entropy( eigvals( Sw^{-1/2} Sb Sw^{-1/2} ) ) )
+
+    i.e. RankMe's effective-rank formula applied to the WITHIN-CLASS-WHITENED between-class scatter
+    (Sb = between-subject scatter of per-subject mean embeddings; Sw = within-subject scatter across
+    augmentations, ridge-regularized by delta). Because it whitens out the augmentation (nuisance)
+    variance, LiDAR counts only augmentation-INVARIANT, subject-discriminative directions -- the
+    'clean' rank. HIGHER = better. Needs q>=2 views per subject; computed in float64 on CPU for the
+    eigendecompositions' numerical stability (called at eval time, not in the training loop)."""
+    E = torch.stack([v.detach() for v in views], dim=1).double().cpu()   # (n, q, d)
+    n, q, d = E.shape
+    if q < 2 or n < 3:
+        return float("nan")
+    mu_i = E.mean(dim=1)                                                 # per-subject mean (n, d)
+    Bc = mu_i - mu_i.mean(dim=0, keepdim=True)
+    Sb = (Bc.t() @ Bc) / (n - 1)                                        # between-class scatter
+    diffs = (E - mu_i.unsqueeze(1)).reshape(n * q, d)
+    Sw = (diffs.t() @ diffs) / (n * (q - 1)) + delta * torch.eye(d, dtype=torch.float64)
+    w, V = torch.linalg.eigh(Sw)                                         # Sw = V diag(w) V^T
+    inv_sqrt = (V * w.clamp_min(eps).rsqrt()) @ V.t()                    # Sw^{-1/2}
+    M = inv_sqrt @ Sb @ inv_sqrt
+    lam = torch.linalg.eigvalsh(0.5 * (M + M.t())).clamp_min(0)
+    p = lam / (lam.sum() + eps) + eps
+    return float(torch.exp(-(p * p.log()).sum()))
+
+
 def jackknife_ci(metric_fn, *tensors: torch.Tensor,
                  alpha: float = 0.05) -> tuple[float, float]:
     """Jackknife (leave-one-out) confidence interval for a label-free metric over subjects.
