@@ -1,10 +1,12 @@
-[watch] 2026-07-27T14:44:01+03:00 watching 9 run(s), poll 300s
-  checkpoints/simsiam_r18_unified_seed42
-  checkpoints/simsiam_r18_unified_seed43
-  checkpoints/simsiam_r18_unified_seed44
-  checkpoints/simsiam_r34_unified_seed42
-  checkpoints/simsiam_r34_unified_seed43
-  checkpoints/simsiam_r34_unified_seed44
-  checkpoints/simsiam_densenet121_unified_seed42
-  checkpoints/simsiam_densenet121_unified_seed43
-  checkpoints/simsiam_densenet121_unified_seed44
+[watch] 2026-07-28T19:36:32+03:00 watching 6 run(s), poll 300s
+  checkpoints/simsiam_r18_unified_seed42_full
+  checkpoints/simsiam_r18_unified_seed43_full
+  checkpoints/simsiam_r18_unified_seed44_full
+  checkpoints/simsiam_r18_unified_seed45_full
+  checkpoints/simsiam_r18_unified_seed46_full
+  checkpoints/simsiam_r18_unified_seed47_full
+[watch] 2026-07-29T13:21:33+03:00 checkpoints/simsiam_r18_unified_seed45_full finished -> submitted downstream job 10094
+[watch] 2026-07-29T13:21:33+03:00 checkpoints/simsiam_r18_unified_seed46_full finished -> submitted downstream job 10095
+[watch] 2026-07-29T14:46:33+03:00 checkpoints/simsiam_r18_unified_seed42_full finished -> submitted downstream job 10096
+[watch] 2026-07-29T15:01:33+03:00 checkpoints/simsiam_r18_unified_seed44_full finished -> submitted downstream job 10097
+[watch] 2026-07-29T15:11:33+03:00 checkpoints/simsiam_r18_unified_seed43_full finished -> submitted downstream job 10098

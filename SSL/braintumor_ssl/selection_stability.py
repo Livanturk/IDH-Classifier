@@ -1,9 +1,10 @@
 """How reproducible is a checkpoint selection if the validation cohort had been slightly different?
 
-`report_run.py` says WHICH epoch each metric picked. This says whether that pick means anything.
-It replays the whole selection rule on random subsets of the val subjects, using the per-epoch
-feature dumps (`<out_dir>/val_features/ep####.npz`, written when `dump_val_features: true`), and
-reports the distribution of selected epochs:
+`report_run.py` says WHICH epoch each metric picked. This measures whether a trailing-mean argmax
+surrogate is sensitive to the validation cohort. It replays the eligibility gate and smoothed metric
+curve on random subsets of the val subjects, using the per-epoch feature dumps
+(`<out_dir>/val_features/ep####.npz`, written when `dump_val_features: true`), and reports the
+distribution of selected epochs:
 
     P(selected epoch == the full-cohort pick)          <- the headline stability number
     the spread of picks across subsamples              <- how wide the "equally good" region is
@@ -18,6 +19,12 @@ features. With n=200 val subjects and d=256 the covariance is rank-deficient; if
 survive a projection to 128 or 64 dimensions (where n > d), the result is not an artifact of that
 rank deficiency. A fixed-seed random orthogonal map is used rather than PCA on purpose — a PCA fitted
 at one epoch would bake that epoch's basis into every other epoch's score.
+
+The online gated policies additionally require a 1-SE improvement before replacing an incumbent
+checkpoint. Recomputing that threshold in every subject subsample would require a nested delete-d
+jackknife, which this utility does not currently do. Thus, whenever `select_se_mult > 0`, its output
+must be called *argmax-surrogate stability*, not stability of the exact saved policy. SPS needs its
+own exact replay because it uses a terminal-plateau rule rather than an argmax.
 
 Everything here is post-hoc: no model, no GPU, no retraining. Add a metric or change a fit window
 and re-run it over the same dumps.
@@ -102,7 +109,7 @@ def score_epoch(feats: dict, metric: str, areq_kw: dict, idx=None, proj=None) ->
 
 
 def select(curves: dict[int, float], smooth_w: int) -> int:
-    """argmax of the trailing-mean-smoothed curve — the offline twin of the training rule."""
+    """Argmax of a trailing-mean curve; it omits the online 1-SE replacement threshold."""
     eps = sorted(curves)
     best_e, best_v = -1, -math.inf
     for i, e in enumerate(eps):
@@ -117,7 +124,8 @@ def select(curves: dict[int, float], smooth_w: int) -> int:
 
 
 def stability(run_dir: str, reps: int, keep_frac: float, smooth_w: int,
-              areq_kw: dict, project: list[int], seed: int = 0) -> None:
+              areq_kw: dict, project: list[int], seed: int = 0, se_mult: float = 0.0,
+              out_csv: str | None = None) -> list[dict[str, object]]:
     dumps = load_dumps(run_dir)
     if not dumps:
         raise SystemExit(f"no val_features/*.npz under {run_dir} — was dump_val_features enabled?")
@@ -133,12 +141,16 @@ def stability(run_dir: str, reps: int, keep_frac: float, smooth_w: int,
     print(f"SELECTION STABILITY  {os.path.basename(os.path.normpath(run_dir))}")
     print(f"  {len(dumps)} eligible epochs, n_val={n}, d={d}, "
           f"{reps} subsamples of {keep} subjects, smoothing window {smooth_w}")
+    if se_mult > 0:
+        print(f"  WARNING: training used select_se_mult={se_mult:g}; results below are "
+              "argmax-surrogate stability, not an exact replay of the saved policy.")
     print("=" * 78)
 
     spaces = [("full d=%d" % d, None)] + [(f"proj d={k}", _projector(d, k, seed + k))
                                           for k in project if 0 < k < d]
     rng = np.random.default_rng(seed)
     subsets = [torch.from_numpy(rng.permutation(n)[:keep].copy()) for _ in range(reps)]
+    rows: list[dict[str, object]] = []
 
     for label, proj in spaces:
         print(f"\n[{label}]")
@@ -159,6 +171,13 @@ def stability(run_dir: str, reps: int, keep_frac: float, smooth_w: int,
             same = sum(1 for p in picks if p == ref) / len(picks)
             q = statistics.quantiles(picks, n=4) if len(picks) >= 4 else [min(picks), 0, max(picks)]
             shift = statistics.fmean(abs(p - ref) for p in picks)
+            rows.append({"run": os.path.basename(os.path.normpath(run_dir)), "space": label,
+                         "metric": METRIC_NAMES[metric], "full_epoch": ref,
+                         "reps": len(picks), "keep_frac": keep_frac, "n_val": n,
+                         "dimension": d if proj is None else int(proj.shape[1]),
+                         "p_same": same, "median_epoch": int(statistics.median(picks)),
+                         "iqr_lo": float(q[0]), "iqr_hi": float(q[2]),
+                         "mean_abs_shift": shift, "seed": seed})
             print(f"    {METRIC_NAMES[metric]:<11}{ref:>12}{same:>9.2f}"
                   f"{int(statistics.median(picks)):>8}{f'[{q[0]:.0f},{q[2]:.0f}]':>13}{shift:>12.1f}")
 
@@ -166,6 +185,15 @@ def stability(run_dir: str, reps: int, keep_frac: float, smooth_w: int,
     print("with a small mean|shift| means a flat plateau (any epoch in it is fine — report the")
     print("plateau, not the argmax). Low P(same) with a large shift means the pick is not identified")
     print("at all, and that metric should not be presented as a selection rule for this run.")
+    if out_csv:
+        os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
+        with open(out_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0]) if rows else [])
+            if rows:
+                writer.writeheader()
+                writer.writerows(rows)
+        print(f"wrote {out_csv} ({len(rows)} rows)")
+    return rows
 
 
 def main() -> None:
@@ -179,6 +207,9 @@ def main() -> None:
     ap.add_argument("--project", type=int, nargs="*", default=[128, 64],
                     help="extra lower-dimensional random-orthogonal checks (empty to skip)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--torch_threads", type=int, default=1,
+                    help="CPU threads for small repeated decompositions (default: 1)")
+    ap.add_argument("--out", default=None, help="optional CSV path for the stability summary")
     args = ap.parse_args()
 
     # mirror the run's own alpha fit window + smoothing so the replay matches how it really selected
@@ -193,7 +224,9 @@ def main() -> None:
     smooth_w = args.smooth_window if args.smooth_window is not None \
         else max(1, int(cfg.get("select_smooth_window", 1)))
 
-    stability(args.run, args.reps, args.keep_frac, smooth_w, areq_kw, args.project, args.seed)
+    torch.set_num_threads(max(1, int(args.torch_threads)))
+    stability(args.run, args.reps, args.keep_frac, smooth_w, areq_kw, args.project, args.seed,
+              float(cfg.get("select_se_mult", 0.0) or 0.0), args.out)
 
 
 if __name__ == "__main__":

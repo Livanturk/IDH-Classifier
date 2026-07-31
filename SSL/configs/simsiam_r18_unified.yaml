@@ -22,7 +22,7 @@ clip_percentiles: [0.5, 99.5]
 aug_preset: clinical
 normalize_after_crop: true
 num_workers: 4
-val_num_workers: 10        # validation loads ~2400 volumes/epoch (200 subj x precise-BN + eval
+val_num_workers: 4         # validation loads ~2400 volumes/epoch (200 subj x precise-BN + eval
                            #   + 8 LiDAR views); at the old 2-worker cap it cost MORE than the
                            #   training epoch. sbatch allocates 12 CPUs/task.  # 4 simultaneous GPU jobs share gzip-compressed NIfTI files on NFS; avoid I/O bursts
 cache_rate: 0.0
@@ -39,7 +39,7 @@ optimizer: sgd
 base_lr: 0.05
 weight_decay: 1.0e-4
 momentum: 0.9
-epochs: 200
+epochs: 100
 batch_size: 16
 warmup_epochs: 10
 fix_pred_lr: true
@@ -49,12 +49,28 @@ grad_clip: 1.0
 # ----- run (seed + out_dir overridden per run by the launcher) -----
 out_dir: checkpoints/simsiam_r18_unified
 seed: 42
-save_every: 20
+save_every: 10
 log_every: 10
 resume: null
 
 # ----- label-free validation monitoring -----
-val_every: 1                 # validate every epoch; logs RankMe + LiDAR + alpha-ReQ each epoch
+# EVERY epoch. The validation grid is not a sampling frequency, it is a SELECTION parameter: every
+# rule in the comparison resolves to an epoch, so an epoch the grid never looked at cannot be picked
+# by any of them (lesson L22 — a uniform 5-epoch grid demonstrably decided the answer). With a
+# per-epoch grid no rule is handicapped by the sampling, and the comparison between rules is about
+# the rules rather than about which epochs each happened to see.
+#
+# Affordable because validation was made ~32% cheaper (lesson L26): the precise-BN pass and the
+# feature pass used to decompress the same 200 deterministic eval volumes twice, and now share one
+# materialization. MEASURED on this cohort (probe job 10087): 177 s/training epoch, 250 s/eval
+# -> 100 epochs + 100 evals = ~11.9 h per run. The previous `val_schedule` (42 evals) was 7.8 h;
+# the extra ~4 h buys the 58 epochs the schedule skipped.
+#
+# NOTE: train_simsiam saves a checkpoint at every VALIDATED epoch, so `val_every: 1` already gives
+# a materializable checkpoint for every epoch — `save_every` below is redundant here, not a second
+# knob to raise.
+val_every: 1
+# val_schedule: {0: 5, 5: 1, 20: 2, 55: 5}   # the previous non-uniform cadence (42 evals, 7.8 h)
 # Selection rule. A single epoch's metric is a noisy estimate over the val subjects: at n=200
 # RankMe's sampling SE is ~0.5, i.e. TEN TIMES the min_delta_rankme below, so an argmax over raw
 # per-epoch values selects noise. Two fixes, both on by default here:
@@ -75,7 +91,7 @@ min_delta_lidar: 0.05
 # freedom for a d x d matrix: A=2 gives 200 < d=256 (degenerate, the ridge carries the estimate),
 # A=8 gives 1400 = 5.5*d. The extra views are crop+augment passes over ONE volume read, so the
 # cost is ~+20-30% wall time per run, not 4x. Drop to 4 (600 dof) if that budget is tight.
-lidar_views: 8
+lidar_views: 4
 min_delta_areq: 0.005         # alpha-ReQ best = min |alpha-1| (epoch closest to 1.0)
 # alpha-ReQ fit window + fit-quality floor. With N=200 val subjects < d=256 the smallest sample
 # eigenvalues are biased DOWN, which steepens the log-log slope and inflates alpha; fitting only
@@ -84,15 +100,20 @@ min_delta_areq: 0.005         # alpha-ReQ best = min |alpha-1| (epoch closest to
 # full-spectrum window gives +0.47 at alpha=2.7). Keep FIXED across every epoch/run/backbone.
 areq_k_min: 1                 # 1-indexed first eigenvalue fitted (head is the best-estimated part)
 areq_k_max_frac: 0.30         # fit lambda_1..lambda_ceil(0.30*k) only; drop the noisy tail
-areq_r2_min: 0.95             # epochs whose power-law fit is worse than this cannot win bestA-ReQ
+areq_r2_min: 0.80             # epochs whose power-law fit is worse than this cannot win bestA-ReQ
                               #   (true power law scores >=0.996 here; a non-power-law control 0.76)
 dump_val_features: true       # <out_dir>/val_features/ep####.npz (~0.6 MB/epoch) -> every spectral
                               #   quantity is recomputable post-hoc without retraining
 best_val_loss_max: -0.8
 best_align_max: 0.15
-early_stop: true
-patience: 25
-min_epochs: 50
+# Early stopping is OFF for the unified runs. `patience` counts EVALS, so under the old uniform
+# grid 25 evals = 125 epochs > the 100-epoch budget and early_stop could never fire — it was dead
+# code. Under `val_schedule` it becomes reachable and would truncate the run around epoch 64,
+# destroying exactly the plateau samples the Pareto pool is drawn from (its front sits at e24-e54).
+# The plateau is the object of study here, so the run is always taken to completion.
+early_stop: false
+patience: 25                  # retained for the R1-baseline plateau counters logged in metrics.csv
+min_epochs: 60
 collapse_stop: true
 collapse_patience: 3
 z_std_min: 0.01

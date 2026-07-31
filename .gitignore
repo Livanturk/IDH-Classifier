@@ -6,17 +6,56 @@ __pycache__/
 .env.*
 !.env.example
 mlruns/
+.venv/
+venv/
+*.egg-info/
+.ipynb_checkpoints/
 
 # Large imaging data — NEVER commit (this is what broke the push)
 BraTS2021/
 UCSF-PGDM/
 UCSF-PDGM/
 UPENN-GBM/
+figshare/
+# Raw volumes / matrices, wherever they land
+*.nii
+*.nii.gz
+*.mat
+*.npy
+*.npz
+
+# Data archives (e.g. 1512427.zip, 839 MB)
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.gz
+!**/*.nii.gz.md5
+
+# Clinical / patient-level metadata — redistribution is licence-restricted (TCIA),
+# and it is patient data even when de-identified. Keep it off GitHub.
+UCSF-PDGM-metadata_v5.csv
+*metadata*.csv
+*clinical*.csv
+
 # Machine-specific / local artifacts
 SSL/BraTS2021
 SSL/checkpoints/
 SSL/scripts/
 SSL/splits/
+SSL/logs/
+slurm-*.out
+*.out
+
+# Model weights / exported encoders
+*.pth
+*.pt
+*.ckpt
+*.pkl
+*.h5
+*.onnx
+SSL/encoders/
 
 # Generated SSL experiment outputs (metrics, embeddings and visualizations)
 SSL/features/
@@ -28,14 +67,28 @@ CLAUDE.md
 AGENTS.md
 commands.txt
 
+# Vendored third-party code (has its own .git — would become a broken submodule)
+SSL/third_party/
+
+# Agent / IDE session artifacts (may contain transcripts, paths, credentials)
+.codex-handoff/
+.claude/
+.aider*
+.DS_Store
 
 # unified dataset (symlinks to ignored data)
 SSL/data_unified/
 data_unified/
 
+# Documents and write-ups (kept out of the code repo on purpose)
 *.md
 *.pdf
-*.ocx
+*.docx
+*.doc
+*.xlsx
+*.xls
+*.pptx
+SSL/docs/
 SSL/*.md
 SSL/*.pdf
 SSL/*.docx

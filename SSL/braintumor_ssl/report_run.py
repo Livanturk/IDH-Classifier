@@ -28,6 +28,17 @@ import os
 
 import torch
 
+from braintumor_ssl.select_epoch import (FALLBACK, load_rows as load_raw_rows,
+                                         select as select_pareto, sps_pick)
+
+# Pre-registered parameters of the Proposed policy (see select_epoch.py and lessons L22): one
+# jackknife SE as the indifference band, and "on the plateau" = within 0.01 of the run's loss floor.
+# PRE-REGISTERED on a priori grounds, not tuned: the rule's output is sensitive to both (L23).
+# Fixed here as the single source of truth so every report uses the same rule; they are deliberately
+# NOT config keys (training never reads them). `select_epoch.py --sweep` audits the sensitivity.
+PLATEAU_TOL = 0.01
+PARETO_EPS = 1.0
+
 # metric key -> (best-checkpoint filename, pretty name, "want" direction text)
 METRICS = {
     "rankme": ("bestRankMe.pth", "RankMe", "higher = richer effective rank"),
@@ -217,11 +228,52 @@ def report_run(run_dir: str) -> dict:
     else:
         print("    metrics.csv missing/empty — cannot assess convergence.")
 
+    # ---- (5b) Stable Plateau Selection — the "Proposed" policy ----------------------
+    # Plateau is read off the METRICS' settled values, so the rule needs neither a convergence gate
+    # (untrained epochs are far from those values and drop out on their own) nor per-metric
+    # direction knowledge (the test is a distance). See select_epoch.sps_pick.
+    print("\n[5b] Stable Plateau Selection (Proposed):")
+    sps = None
+    if rows:
+        sps = sps_pick(load_raw_rows(run_dir))
+        print(f"    plateau evals={sps.get('n_plateau')}/{sps.get('n_evals')}  "
+              f"tol={sps['tol']:.0%} consec={sps['consec']}")
+        print(f"    -> {'epoch ' + str(sps['epoch']) if sps['epoch'] is not None else FALLBACK}"
+              f"   ({sps['decision']})")
+    else:
+        print("    metrics.csv missing/empty.")
+
+    # ---- (5c) plateau-gated Pareto front (ablation) ---------------------------------
+    # The front SIZE is the headline diagnostic, not a by-product: it counts how many plateau
+    # epochs the three metrics cannot rank against each other. A front of 1 means they agree and
+    # the pick is theirs; a wide front means they carry no independent signal at this resolution
+    # and the honest output is a deferral. See select_epoch.py.
+    print("\n[5c] Plateau-gated Pareto selection (ablation):")
+    pareto = None
+    if rows:
+        r2_min = float(cfg.get("areq_r2_min", 0.0) or 0.0)
+        pareto = select_pareto(load_raw_rows(run_dir), PLATEAU_TOL, PARETO_EPS, r2_min)
+        print(f"    pool={pareto['n_pool']}/{pareto['n_converged']} converged epochs on the plateau "
+              f"(val_loss <= {pareto['plateau_val_loss']}+{PLATEAU_TOL})")
+        print(f"    front size={pareto['front_size']}  epochs={pareto['front_epochs']}  "
+              f"(eps={PARETO_EPS} SE)  -> {pareto['decision']}"
+              + (f" epoch {pareto['epoch']}" if pareto["epoch"] is not None else f" ({FALLBACK})"))
+    else:
+        print("    metrics.csv missing/empty — cannot compute the front.")
+
     # ---- (6) flat summary row -----------------------------------------------------
     summary = {"config": name, "backbone": backbone, "seed": seed, "split": split,
                "n_val_epochs": len(rows),
                "final_epoch": int(rows[-1]["epoch"]) if rows else "",
-               "stop_reason": (rows[-1].get("stop_reason", "") if rows else "")}
+               "stop_reason": (rows[-1].get("stop_reason", "") if rows else ""),
+               "pareto_front_size": pareto["front_size"] if pareto else "",
+               "pareto_front_epochs": " ".join(str(e) for e in pareto["front_epochs"]) if pareto else "",
+               "pareto_pool": pareto["n_pool"] if pareto else "",
+               "pareto_decision": pareto["decision"] if pareto else "",
+               "pareto_epoch": (pareto["epoch"] if pareto and pareto["epoch"] is not None else ""),
+               "sps_epoch": (sps["epoch"] if sps and sps["epoch"] is not None else ""),
+               "sps_decision": sps["decision"] if sps else "",
+               "sps_n_plateau": sps.get("n_plateau", "") if sps else ""}
     for key, (_, pretty, _) in METRICS.items():
         s = present.get(key)
         pre = pretty.replace("-", "").replace(" ", "")

@@ -103,6 +103,10 @@ def recompute_bn_stats(model, loader, device: str, max_batches: int = 100) -> in
     average over `loader` (encoder path only). Fixes eval-mode feature scale when a
     checkpoint is under-trained, and adapts BN to a new cohort for cross-site transfer.
     Returns the number of batches used.
+
+    `loader` is any iterable of batches, not necessarily a DataLoader — callers that need a second
+    pass over the same deterministic views pass an already-materialized list instead, so the cohort
+    is decompressed once rather than once per pass (see train_simsiam.validate).
     """
     from torch.nn.modules.batchnorm import _BatchNorm
 

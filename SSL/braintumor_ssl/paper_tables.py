@@ -38,9 +38,34 @@ import sys
 # downstream metric -> (column header, decimals)
 DOWNSTREAM = [("auc", "AUC", 3), ("acc", "Acc", 3), ("f1", "F1", 3), ("sens", "Sens", 3),
               ("spec", "Spec", 3), ("prec", "Prec", 3), ("balanced_acc", "BalAcc", 3)]
-POLICY_ORDER = ["bestRankMe.pth", "bestLiDAR.pth", "bestA-ReQ.pth", "last.pth"]
-POLICY_NAME = {"bestRankMe.pth": "RankMe-selected", "bestLiDAR.pth": "LiDAR-selected",
-               "bestA-ReQ.pth": "alpha-ReQ-selected", "last.pth": "final/plateau"}
+# The comparison ladder, in table order (methodology §8.2). EVERY checkpoint the probe can emit is
+# listed: anything missing here falls through to its raw filename and to the end of the table, which
+# is how `bestSPS.pth` and the ungated baselines ended up printed as filenames BELOW the rows they
+# are supposed to precede.
+#
+# `last.pth` is deliberately NOT called "final/plateau" any more. It is the last training epoch —
+# i.e. the result of making no selection at all — and naming it after the plateau invited exactly
+# the confusion that a genuine plateau rule (SPS) now sits next to it in the same table.
+POLICY_ORDER = [
+    "randominit",
+    "bestNaiveRankMe.pth", "bestNaiveLiDAR.pth", "bestNaiveA-ReQ.pth",
+    "bestRankMe.pth", "bestLiDAR.pth", "bestA-ReQ.pth",
+    "bestSPS.pth",
+    "bestPareto.pth",
+    "last.pth",
+]
+POLICY_NAME = {
+    "randominit": "random-init (no pretraining)",
+    "bestNaiveRankMe.pth": "ungated argmax — RankMe",
+    "bestNaiveLiDAR.pth": "ungated argmax — LiDAR",
+    "bestNaiveA-ReQ.pth": "ungated argmax — AlphaReQ",
+    "bestRankMe.pth": "RankMe-selected",
+    "bestLiDAR.pth": "LiDAR-selected",
+    "bestA-ReQ.pth": "AlphaReQ-selected",
+    "bestSPS.pth": "Proposed (SPS)",
+    "bestPareto.pth": "Pareto (ablation)",
+    "last.pth": "last epoch (no selection)",
+}
 
 
 def _f(v):
@@ -111,7 +136,7 @@ def table_downstream(probe_csvs: list[str], out_csv: str) -> None:
     print("\n" + "=" * 116)
     print("TABLE 2 — downstream IDH (UCSF-PDGM, frozen linear probe).  mean±SD over seeds")
     print("=" * 116)
-    print(f"{'backbone':<13}{'policy':<20}{'arm':<11}"
+    print(f"{'backbone':<13}{'policy':<29}{'arm':<11}"
           + "".join(f"{h:>13}" for _, h, _ in DOWNSTREAM) + f"{'seeds':>7}")
 
     out = []
@@ -123,9 +148,12 @@ def table_downstream(probe_csvs: list[str], out_csv: str) -> None:
         backbone, ckpt, arm = key
         rs = groups[key]
         cells = {m: _agg([_f(r.get(m)) for r in rs], d) for m, _, d in DOWNSTREAM}
-        print(f"{backbone:<13}{POLICY_NAME.get(ckpt, ckpt):<20}{arm:<11}"
+        print(f"{backbone:<13}{POLICY_NAME.get(ckpt, ckpt):<29}{arm:<11}"
               + "".join(f"{cells[m]:>13}" for m, _, _ in DOWNSTREAM) + f"{len(rs):>7}")
-        out.append({"backbone": backbone, "policy": POLICY_NAME.get(ckpt, ckpt), "arm": arm,
+        # `ladder` travels with the row so the rung survives re-sorting: opening the CSV in a
+        # spreadsheet and sorting by any column would otherwise scramble the comparison order.
+        out.append({"ladder": POLICY_ORDER.index(ckpt) if ckpt in POLICY_ORDER else 99,
+                    "backbone": backbone, "policy": POLICY_NAME.get(ckpt, ckpt), "arm": arm,
                     **{m: cells[m] for m, _, _ in DOWNSTREAM}, "n_seeds": len(rs)})
 
     if clinical:
@@ -137,14 +165,14 @@ def table_downstream(probe_csvs: list[str], out_csv: str) -> None:
                 continue
             seen.add(arm)
             cells = {m: f"{_f(r.get(m)):.{d}f}" for m, _, d in DOWNSTREAM}
-            print(f"{'— clinical —':<13}{'(no imaging)':<20}{arm:<11}"
+            print(f"{'— clinical —':<13}{'(no imaging)':<29}{arm:<11}"
                   + "".join(f"{cells[m]:>13}" for m, _, _ in DOWNSTREAM) + f"{'1':>7}")
-            out.append({"backbone": "clinical", "policy": "(no imaging)", "arm": arm,
+            out.append({"ladder": 99, "backbone": "clinical", "policy": "(no imaging)", "arm": arm,
                         **{m: cells[m] for m, _, _ in DOWNSTREAM}, "n_seeds": 1})
-        print("\nRead the imaging rows AGAINST the clinical rows. In this cohort IDH is nearly")
-        print("collinear with WHO grade, so age alone is a strong predictor; the claim a paper can")
-        print("make is about the image+age arm's gain over age, and about DIFFERENCES BETWEEN")
-        print("policies/backbones, which share the confound and are therefore comparable.")
+        print("\nClinical rows are CONTEXT, not rungs of the ladder: in this cohort IDH is nearly")
+        print("collinear with WHO grade and age alone reaches ~0.90. Every imaging row shares that")
+        print("confound, so the comparison BETWEEN rungs is unaffected by it — only the absolute")
+        print("level of the imaging arms has to be read against these numbers.")
     _write(out, out_csv)
 
 

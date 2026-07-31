@@ -81,6 +81,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--log_every", type=int)
     # label-free validation monitoring (0 = off; saves best.pth by RankMe when > 0)
     ap.add_argument("--val_every", type=int)
+    ap.add_argument("--val_schedule",
+                    help="non-uniform validation cadence 'start:every,...' (e.g. '0:5,5:1,20:5'); "
+                         "overrides --val_every. Dense where the convergence gate is crossed.")
     ap.add_argument("--min_delta_rankme", type=float)
     # best.pth convergence gate: only rank an epoch by RankMe once it has genuinely learned
     ap.add_argument("--best_val_loss_max", type=float,
@@ -161,24 +164,36 @@ def validate(model: SimSiam, val_records: list, cfg: dict, device: str, use_amp:
     from torch.nn.modules.batchnorm import _BatchNorm
 
     was_training = model.training
-    # Validation is no longer a cheap side-show: 200 val subjects x (precise-BN pass + eval view +
-    # lidar_views augmented views) is ~2400 volume-loads per epoch and it runs EVERY epoch, so with
-    # the old hard cap of 2 workers it cost more wall time than the training epoch itself. It gets
-    # its own worker count because nothing else is running while it does.
+    # Validation is not a cheap side-show. Measured on the ResNet18 runs: one eval costs ~367 s
+    # against a ~173 s training epoch, i.e. every validation is worth ~2.1 epochs of training, and
+    # that ratio — not the metric code — is what makes the validation cadence a budget decision
+    # (lesson L22). The cost is dominated by gzipped-NIfTI I/O, so the two levers are how many
+    # passes over the cohort a validation makes (see the materialization below) and how many workers
+    # decompress in parallel. It gets its own worker count because nothing else runs while it does.
     nw = int(cfg.get("val_num_workers", 0) or min(cfg["num_workers"], 2))
     bs = cfg["batch_size"]
     max_bn = 2 if cfg["smoke"] else 200
 
     eval_ld = DataLoader(make_views(val_records, cfg, mode="eval"), batch_size=max(bs, 2),
-                         shuffle=False, num_workers=nw, pin_memory=(device == "cuda"))
+                         shuffle=False, num_workers=nw, pin_memory=False)
+    # The eval view is DETERMINISTIC — one centred crop, no augmentation, no RNG (BraTSViews with
+    # mode="eval" calls _view(..., training=False), and the tumour crop only jitters when training).
+    # So the precise-BN pass and the feature pass below were decompressing and preprocessing the
+    # SAME 200 subjects twice: two thirds of validation's NIfTI I/O, for byte-identical tensors.
+    # Materializing once removes that pass at no numerical cost whatsoever.
+    # Memory: n_val x C x roi^3 x 4 B — ~7 GB at 200 subjects, 4 modalities and 128^3, held only for
+    # the duration of this call (hence pin_memory=False: pinning 7 GB to save 13 H2D copies is a bad
+    # trade). If a much larger val cohort ever makes that unaffordable, the fix is to stream again,
+    # not to shrink the cohort — the cohort size is a measurement decision (methodology §6).
+    eval_batches = list(eval_ld)
 
     # --- representation metrics on precise-BN-adapted features, then restore BN ---
     bn_mods = [m for m in model.modules() if isinstance(m, _BatchNorm) and m.running_mean is not None]
     snapshot = [(m.running_mean.clone(), m.running_var.clone(), m.num_batches_tracked.clone())
                 for m in bn_mods]
-    recompute_bn_stats(model, eval_ld, device, max_batches=max_bn)  # adapts encoder-path BN; leaves model.eval()
+    recompute_bn_stats(model, eval_batches, device, max_batches=max_bn)  # adapts encoder-path BN; leaves model.eval()
     feats = []
-    for it, batch in enumerate(eval_ld):
+    for it, batch in enumerate(eval_batches):
         if cfg["smoke"] and it >= 2:
             break
         with torch.amp.autocast("cuda", enabled=use_amp):
@@ -301,6 +316,37 @@ def is_collapsed(m: dict, th: dict) -> tuple[bool, str]:
     return False, "ok"
 
 
+def parse_val_schedule(cfg: dict) -> list[tuple[int, int]]:
+    """Validation cadence as sorted [(from_epoch, every), ...]; a plain `val_every` is the
+    one-segment case.
+
+    Why non-uniform (lesson L22): selection collapses to "the first epoch through the convergence
+    gate", and that crossing happens in the steepest part of the loss curve. A coarse uniform grid
+    therefore does not merely blur the metric estimate — it DECIDES which epoch is selected. Being
+    dense only across the crossing window buys back the resolution where it changes the answer,
+    at a fraction of the cost of validating every epoch (each eval costs ~2 training epochs).
+    """
+    if int(cfg.get("val_every", 0) or 0) == 0 and cfg.get("val_every") is not None:
+        return []                                  # `val_every: 0` stays the documented kill switch
+    sched = cfg.get("val_schedule")
+    if not sched:
+        every = int(cfg.get("val_every", 0) or 0)
+        return [(0, every)] if every > 0 else []
+    if isinstance(sched, str):                     # CLI form: "0:5,5:1,20:5"
+        sched = dict(part.split(":") for part in sched.split(",") if part.strip())
+    return sorted((int(s), int(e)) for s, e in dict(sched).items() if int(e) > 0)
+
+
+def should_validate(epoch: int, segments: list[tuple[int, int]], is_last: bool) -> bool:
+    """Validate on the last epoch, else at the cadence of the segment this epoch falls in."""
+    if not segments:
+        return False
+    if is_last:
+        return True
+    start, every = max((s for s in segments if s[0] <= epoch), default=segments[0])
+    return (epoch + 1 - start) % every == 0
+
+
 def is_converged(m: dict, cfg: dict) -> bool:
     """Best-checkpoint eligibility gate: only rank an epoch by RankMe once the encoder has
     actually learned view-invariance. Without this, RankMe is *highest at random init* — the
@@ -399,9 +445,11 @@ def main() -> None:
         persistent_workers=cfg["num_workers"] > 0,
     )
     print(f"[data] train subjects={len(train_ds)} iters/epoch={len(train_ld)}")
-    val_records = split.get("val", []) if cfg.get("val_every", 0) else []
+    val_segments = parse_val_schedule(cfg)
+    val_records = split.get("val", []) if val_segments else []
     if val_records:
-        print(f"[data] val subjects={len(val_records)} (label-free monitor every {cfg['val_every']} ep)")
+        cadence = ", ".join(f"from e{s}: every {e}" for s, e in val_segments)
+        print(f"[data] val subjects={len(val_records)} (label-free monitor — {cadence})")
 
     # ---- model ----
     model = SimSiam(
@@ -517,7 +565,12 @@ def main() -> None:
         tracker.log_metrics(train_metrics, step=epoch)
 
         is_last = epoch == cfg["epochs"] - 1
-        if is_last or (epoch + 1) % cfg["save_every"] == 0:
+        do_val = bool(val_records) and should_validate(epoch, val_segments, is_last)
+        # Every VALIDATED epoch is a selection candidate, so it must be materializable: the
+        # plateau+Pareto rule (`select_epoch.py`) runs post-hoc off metrics.csv and can name any
+        # eval epoch, not just the `save_every` grid. Without this the post-hoc pick would have no
+        # weights to point at. Storage is not the constraint here (~270 MB per checkpoint).
+        if is_last or do_val or (epoch + 1) % cfg["save_every"] == 0:
             state = {"epoch": epoch, "model": model.state_dict(),
                      "optimizer": optimizer.state_dict(), "cfg": cfg}
             save_checkpoint(state, os.path.join(cfg["out_dir"], f"ckpt_e{epoch:03d}.pth"))
@@ -527,9 +580,14 @@ def main() -> None:
                         os.path.join(cfg["out_dir"], "last.pth"))
 
         # ---- optional label-free validation + best-checkpoint / early stop ----
-        do_val = bool(val_records) and ((epoch + 1) % cfg["val_every"] == 0 or is_last)
         if do_val:
+            # Timed because the validation cadence is a budget decision, not a formatting one: one
+            # eval is worth ~2 training epochs here, so `val_schedule` trades wall time for plateau
+            # resolution (lesson L22). Logging the cost makes that trade auditable per run instead
+            # of something you re-derive from job wall clock afterwards.
+            t_val = time.time()
             vm = validate(model, val_records, cfg, device, use_amp)
+            val_secs = time.time() - t_val
             dump_val_features(cfg, epoch, vm.pop("_features"))   # pop: keep tensors out of the ckpt
             th = collapse_thresholds(vm["n_val"], cfg)
             collapsed, why = is_collapsed(vm, th)
@@ -538,7 +596,8 @@ def main() -> None:
                   f"rankme={vm['rankme']:.3f} lidar={vm['lidar']:.3f} areq={vm['alpha_req']:.3f} "
                   f"pr={vm['participation_ratio']:.2f} align={vm['alignment']:.4f} "
                   f"unif={vm['uniformity']:+.3f} converged={converged} collapsed={collapsed}"
-                  + ("" if not collapsed else f" ({why})"))
+                  + ("" if not collapsed else f" ({why})")
+                  + f" time={val_secs:.0f}s")
             lr_now = optimizer.param_groups[0]["lr"]
 
             # --- per-metric best-checkpoint update (shared eligibility gate; L13) ---

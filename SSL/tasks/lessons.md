@@ -5,6 +5,21 @@ bildiride her kararı gerekçeyle savunabilmek. Yeni bir düzeltme/karar geldik�
 
 ---
 
+## L28 — Aynı encoder checkpoint'i, ayrı precise-BN geçişleriyle ayrı policy sonucu gibi raporlama
+
+**Bağlam.** RankMe, LiDAR ve AlphaReQ beş canonical seed'in her birinde aynı pretraining epoch'unu
+ve birebir aynı `model` state'ini seçti.
+**Ne oldu.** Downstream evaluator, her checkpoint dosyası için precise-BN'i `shuffle=True` ve
+`drop_last=True` ile yeniden çalıştırıyordu. Sonuç olarak aynı encoder, farklı batch sırası ve farklı
+atılan son batch üzerinden BN statistics alıyor; çok küçük feature/AUC farkları yapay olarak oluşuyordu.
+**Çıkarım/Kural.** Precise-BN, policy-specific stochastic işlem değil encoder evaluation'ın parçasıdır:
+sabit subject sırası, `drop_last=False` ve aynı `(run, pretraining epoch)` için ortak canonical feature
+cache zorunludur. Aynı weights'ten gelen policy'ler aynı downstream prediction'ı vermelidir.
+**Uygulandı.** `idh_probe.py`: `detbn-v2` cache, deterministic precise-BN ve epoch-canonical cache key;
+`scripts/final_paired_selection_analysis.py`: yalnız bu yeni cache üzerinden final inference.
+
+---
+
 ## L1 — RankMe random-init'te tavan yapar; "best" çökme değil, YAKINSAMA kapılanmalı
 
 **Bağlam.** best.pth "en yüksek RankMe" ile kaydediliyordu.
@@ -315,5 +330,259 @@ Eski kural: ham per-epoch değerin argmax'ı + elle yazılmış `min_delta_*`.
 
 **Kaynak.** `CHECKPOINT_SELECTION_METHODOLOGY.md` §7, [Efron&Tibshirani1993], L18, L17.
 
+## L20 — Bir kohortu ilk kez okuduğun yerde bütünlük kontrolü yap (2026-07-28)
+
+**Bağlam.** Dokuz encoder pretraining'i sorunsuz koştu, ama ilk downstream işi UCSF'in ilk
+deneklerinde `zlib.error: invalid block type` ile düştü ve **dokuz downstream işini birden**
+bloke etti.
+
+**Ders.**
+1. **Geçici I/O ile gerçek bozulmayı ayır.** `data.py` paylaşımlı depoda transient okuma hatalarına
+   karşı 3 kez deniyor (L15). Bu dosya üç denemede de aynı hatayı verdi → gerçek bozulma.
+   `gzip -t` ile doğrula; deterministik hata = bozuk dosya, retry ile çözülmez.
+2. **Bozulma sadece o kohortu ilk kullandığında ortaya çıkar.** UCSF pretraining'den dışlandığı için
+   2505 dosyası aylarca hiç açılmamıştı. Yeni bir kohortu pipeline'a sokarken **önce** tara:
+   `find <dir> -name '*.nii.gz' -print0 | xargs -0 -P12 -I{} sh -c 'gzip -t "{}" || echo "{}"'`
+   (2505 dosya ~30 sn). 501 denekten 1'i bozuktu.
+3. **Hatayı yutma, listele.** `try/except` ile sessizce atlamak yerine
+   `splits/ucsf_excluded_subjects.txt`e gerekçesiyle yaz ve `idh_probe` oradan filtrelesin.
+   Bildiride kohort **n=500** olarak raporlanmak zorunda; sessiz atlama bu sayıyı denetlenemez yapar.
+4. **Tek bir bozuk dosya tüm downstream ızgarasını durdurur.** Otomasyon zincirinde tek noktadan
+   çöken bir adım varsa, o adımın girdisini zincir kurulmadan önce doğrula.
+
+**Kaynak.** L15 (transient okuma), `braintumor_ssl/idh_probe.py:load_exclusions`.
+
+## L21 — Üç metrik AYNI checkpoint'i seçti: aday havuzu platoyu içermek zorunda (2026-07-28)
+
+**Bulgu (ölçüldü, tahmin değil).** Dokuz unified run'ın hepsinde `bestRankMe.pth`, `bestLiDAR.pth`
+ve `bestA-ReQ.pth` **byte-identical** (md5 aynı; r18 ep9, r34/densenet ep14). Dolayısıyla
+"hangi seçim kuralı downstream'de kazanır?" sorusu ölçülemedi — UCSF probe'unda üç satır arasındaki
+fark ≤0.003 AUC iken tek hücrenin CV std'si ±0.006–0.011.
+
+**Kök neden.** `eligible = converged and (not collapsed)` — havuzda **plato koşulu yok**. RankMe ve
+−|α−1| yakınsama sonrası monoton azaldığı için "uygun epoch'lar arasında argmax" her zaman **en erken
+uygun epoch**a çözünüyor; üçü de aynı eval'de ateşliyor. Yan etki: `selection.rule.window` her zaman 1,
+yani `select_smooth_window` (trailing mean) ve `select_se_mult` (jackknife SE eşiği) — L19'un iki ana
+korumasi — **hiç devreye girmedi**; önceki best `-inf` olduğu için eşik trivially aşıldı.
+
+**İroni.** `select_model.py` aynı hatayı bir üst katmanda (run'lar arası) zaten belgelemişti:
+max-RankMe-among-converged "steep transient at a seed-dependent convergence epoch", CV ~%24, ve
+oradaki çözüm plato checkpoint'ine geçmekti. Bu ders **epoch seçimi katmanına hiç uygulanmamıştı**.
+
+**Metrikler bağımsız kanıt değil.** Uygun epoch'lar üzerinde Spearman:
+ρ(RankMe, α-ReQ) = **+0.930 / +0.934 / +0.920** (r18 / r34 / densenet). α-ReQ bu rejimde RankMe'nin
+neredeyse monoton bir dönüşümü. Kısmen bağımsız tek metrik LiDAR (ρ = +0.29…+0.89, backbone'a göre
+oynak). Bildiride üç satır gösterilecekse bu korelasyon **birlikte** raporlanmalı.
+
+**Karar.** Plato kapısı + SE-duyarlı Pareto, `braintumor_ssl/select_epoch.py` içinde **post-hoc**
+uygulanır (online değil: eğitim sırasında running-min val_loss o anki değere eşit olduğundan ilk uygun
+epoch her "platoya yakın" testini trivially geçer; plato ancak tam eğri varken tanımlı). Online
+`best*.pth` olduğu gibi kalır ve bildiride **R1 baseline** rolünü üstlenir.
+Kural: havuz = converged ∧ ¬collapsed ∧ areq_r2 ≥ 0.80 ∧ `val_loss ≤ min(val_loss) + plateau_tol`;
+front = (RankMe, LiDAR, −|α−1|) üzerinde domination'ın `pareto_eps` × jackknife SE'yi aşmasını
+gerektiren Pareto; |front| = 1 → seç, |front| > 1 → **"etiketsiz ayrım yok"** deyip `last.pth`'e düş.
+Seçim yapmayı reddedebilmek kuralın özelliği, kusuru değil.
+
+**Kaynak.** `select_epoch.py`, `select_model.py:8-14`, `CHECKPOINT_SELECTION_METHODOLOGY.md` §5.2, L13, L19.
+
+## L22 — Validation ızgarası bir ölçüm parametresi değil, bir SEÇİM parametresidir (2026-07-28)
+
+**Bulgu.** `val_every: 5` masum bir örnekleme sıklığı gibi görünüyordu. Seçim "kapıyı geçen ilk epoch"a
+indirgendiği için (L21) ve kapı geçişi val_loss'un en hızlı değiştiği yere denk geldiği için, ızgara
+**cevabı belirledi**:
+- `r34_s43`: train loss e10=−0.719 → e11=−0.855, yani kapı ~e11'de geçildi; ızgara 14'e baktı.
+  RankMe e9=18.47, e14=10.11 → seçilen checkpoint ~%40 farklı bir noktada.
+- `densenet_s42`: e9'da val_loss=−0.8836 kapıyı geçmiş ama alignment 0.1632 vs eşik 0.15 — **kıl payı**
+  eledi, 5 epoch ve ~5 RankMe puanı kayıp.
+- Sonuç: r18 e9'da, r34/densenet e14'te seçildi. **Backbone karşılaştırması farklı eğitim miktarlarını
+  kıyaslıyor**, ve bu fark bir backbone özelliği değil ızgara artefaktı.
+
+**Ders.** Bir eşik-geçişi kuralı kullanıyorsan, örnekleme çözünürlüğünü eşiğin geçildiği yerde
+belirle. Düzgün ızgara maliyeti yanlış yere harcar.
+
+**Uygulama.** `val_schedule: {0: 5, 5: 1, 20: 2, 55: 5}` (42 eval, eskisi 20): geçiş penceresinde
+(e5–19) her epoch, Pareto front'unun yaşadığı yerde (e20–54) her 2, düz platoda her 5. Eval başına
+maliyet ~400 s ≈ 2.2 training epoch'u (r18: toplam 7s16dk, saf eğitim 5s02dk), yani **+2.4 h/run** —
+her epoch validate etmenin +8.9 h'ına karşı. Her **validate edilen** epoch'a checkpoint yazılır, aksi
+halde post-hoc seçicinin işaret edeceği ağırlık olmaz.
+
+**Yan karar — early stopping KAPATILDI.** `patience` eval cinsinden sayılıyor: eski ızgarada
+25 eval = 125 epoch > 100 bütçesi, yani `early_stop: true` **ölü koddu**. Yeni şemada ulaşılabilir
+hale gelip run'ı ~e64'te kesecekti — Pareto havuzunun beslendiği plato örneklerini tam olarak yok
+ederek. Plato burada inceleme nesnesi olduğu için run'lar sonuna kadar koşturulur.
+
+**Kaynak.** `train_simsiam.parse_val_schedule`, `logs/pretrain_10058_*.out`, L21.
+
+## L23 — LIMITATION: Pareto kuralı kendi hiperparametrelerine kararsız (2026-07-28)
+
+**Bulgu.** `select_epoch.py --sweep`, 9 run × (`plateau_tol` ∈ {0.005, 0.01, 0.02}) ×
+(`pareto_eps` ∈ {0, 0.5, 1, 2}): kesin seçim yapılan run sayısı **0/9 ile 7/9 arasında** oynuyor ve
+monoton bir örüntü yok. Aynı run için seçilen epoch hücreden hücreye kayıyor (`r18_s42`: e29 / e39 /
+deferred). eps=2 SE'de her yerde front şişip 0/9'a düşüyor; eps=0.5, tol=0.01'de 7/9.
+
+**Neden.** Plato havuzu 5 epoch aralıklı yalnızca 13–16 nokta, ve platoda metrik farkları çoğunlukla
+kendi SE'lerinin altında. SE bantlarıyla "A, B'yi domine eder mi" sorusu yazı-tura oluyor.
+
+**Ders.** Bu tam olarak `CHECKPOINT_SELECTION_METHODOLOGY.md` §4'ün uyardığı *researcher degrees of
+freedom* problemi. Seçim oranını maksimize eden (eps, tol) çiftini seçmek post-hoc tuning olur ve
+bildiriyi savunulamaz kılar.
+
+**Karar.**
+1. (`plateau_tol` = 0.01, `pareto_eps` = 1.0) **ön-kayıtlıdır** ve gerekçesi a priori: 1 SE, L19'un
+   `select_se_mult` ile zaten kullandığı "fark kendi belirsizliğini aşmalı" konvansiyonu; 0.01,
+   val_loss'un [−1, 0] sınırlı ölçeğinin %1'i. Seçim oranına bakarak **seçilmedi** (o değerlerde
+   yalnızca 3/9 kesin seçim çıkıyor — düşük, ama dürüst).
+2. Duyarlılık ızgarası bildiride **limitation olarak raporlanır**, gizlenmez.
+3. Yoğun validation (L22) plato çözünürlüğünü ~2 katına çıkarır; kararlılık **yeniden koşumdan sonra**
+   tekrar ölçülmeli. Şu anki 3/9 rakamı 42-eval'lik run'lar için geçerli değildir.
+4. Parametreler tek kaynakta sabit: `report_run.PLATEAU_TOL` / `PARETO_EPS`. Training configlerine
+   konmadı — eğitim onları okumuyor, okunmayan config anahtarı tuzaktır.
+
+**Kaynak.** `select_epoch.sweep`, `results/pareto_sensitivity.csv`, `CHECKPOINT_SELECTION_METHODOLOGY.md` §4.
+
+## L24 — Seyreklik bir SONUÇ mu yoksa optimizer hatası mı? (2026-07-28)
+
+**Bağlam.** Defterdeki downstream planı 258 sütunluk tasarımı (256 encoder + age + sex) ElasticNet
+ile ~30 özelliğe indirmeyi öngörüyordu. İlk uygulamada `LogisticRegressionCV(solver="saga",
+max_iter=5000)` gerçekten seyreklik üretti — 98/258 — ama `ConvergenceWarning` ile birlikte.
+
+**Bulgu (UCSF, n=500, 103 pozitif).**
+
+| konfigürasyon | AUC | tutulan özellik |
+|---|---|---|
+| L2 logistic (referans) | 0.901 | 258/258 |
+| enet, max_iter=5000 (**yakınsamadı**) | 0.885 | **98**/258 |
+| enet, max_iter=20000, tol=1e-3 (yakınsadı) | 0.904 | **231**/258 |
+| enet + top-k=30 zorlaması | 0.900 (image+age+sex) / **0.678** (image) | 30 |
+
+**Ders.** Yakınsamamış bir L1/elastic-net çözümü **yapay olarak seyrektir**: koordinatlar henüz
+sıfırdan uzaklaşmamıştır. O 98 sayısı bir özellik seçimi değil, bir optimizer arızasıdır — ve
+daha DÜŞÜK AUC ile gelir, yani "seyreklik ücretsiz" yanılsaması bile vermez. Herhangi bir seyreklik
+rakamı raporlanmadan önce yakınsama doğrulanmalı (`ConvergenceWarning` = rakam geçersiz).
+
+**Sonuç.** Düzgün yakınsayınca iç CV seyrekliği neredeyse hiç seçmiyor (231/258): bu kohortta
+encoder boyutlarını atmak AUC'ye mal oluyor. Yani **"258→30" veriden gelen bir bulgu değil, analistin
+koyduğu bir kısıt.** İkisi de destekleniyor: varsayılan `--head elasticnet` seyrekliği iç CV'ye
+bırakıp fiilî sayıyı raporlar; `--enet_top_k 30` defterdeki varyantı üretir ama bedeli görünür —
+saf `image` kolunda AUC 0.729 → 0.678.
+
+**Ayrıca (bu tabloda asıl okunması gereken).** `image+age+sex` AUC'si 0.90 civarı, ama **age tek
+başına ~0.90**. Bu kolda görüntünün katkısı ölçülmüyor. Seçim kurallarını ayırt edebilecek tek kol
+saf `image` (~0.68–0.76), ve `paper_auc_table.py` varsayılanı bu yüzden `--arm image`.
+
+**Kaynak.** `idh_probe._enet` / `TopKElasticNet`, L21.
+
+## L25 — "Seçmeyi reddetmek" bir kola dönüşürse deneyi bozar (2026-07-28)
+
+**Bağlam.** Kapsam `Proposed Experimental Framework` belgesiyle daraltıldı: tek backbone (ResNet18),
+tek soru — önerdiğimiz seçim kuralı mevcut kurallardan daha iyi bir checkpoint mi seçiyor. Kollar:
+random-init · naive argmax ×3 · gated argmax ×3 · **Proposed** · last epoch.
+
+**Ne oldu.** L21'de tasarlanan "front > 1 → etiketsiz ayrım yok → `last.pth`'e düş" davranışı, tek
+başına doğru bir refleksti (üç neredeyse-eşdoğrusal metrikle zorlamalı tie-break sahte kazanan
+üretir). Ama bu davranış **`last.pth`'in ayrı bir kol olduğu** bir tabloya girince kendi kendini
+sabote ediyor: Proposed bazı seed'lerde Last-epoch kolunun kopyası oluyor (r18: s42 deferred, s43
+e24, s44 e34) ve iki kolun kıyası tanımsızlaşıyor. Ölçüm aracı, ölçtüğü şeyin içine karışıyor.
+
+**Ders.**
+1. **Bir kuralın "karar veremiyorum" çıkışı, karşılaştırmadaki başka bir kolun kendisi olamaz.**
+   Belirsizliği bildirmek ile artefakt üretmek ayrı iki iştir; kural ikisini de yapmalı.
+2. Çözüm: `deferred` **bayrağı korunur ve raporlanır**, ama checkpoint front'un **medyan epoch'u**
+   olur. Front üyelerinin hepsi zaten converged ∧ plato ∧ non-dominated — aralarında etiketsiz
+   tercih yok, ama hepsi geçerli aday. Medyan deterministik ve `pareto_eps`'e front'un tam
+   büyüklüğünden çok daha az duyarlı (L23'ün duyarsızlık problemini kısmen hafifletir).
+3. **Boş havuz ≠ geniş front.** Boş havuzda seçilecek aday yoktur (bir tie-break değil, bir yokluk),
+   `last.pth` orada meşru. Üç değerli karar alanı: `selected` / `deferred` / `fallback`.
+4. `median_low` kullan, ortalama değil: seçilen epoch'un diskte bir checkpoint'i olmak zorunda.
+
+**Yan bulgu (aynı turda ölçüldü).** Kapısız argmax ("literatüre sadık" naive kol) üç r18 seed'inde
+de, üç metrikte de **epoch 4**'ü seçiyor: val_loss ≈ −0.13…−0.18, `converged=False`, yani neredeyse
+eğitilmemiş ağırlıklar. L1'de teorik olarak öngörülen başarısızlık modu artık ölçülmüş bir baseline.
+
+**Uygulandı.** `select_epoch.front_representative` / `select` / `copy_epoch` / `--baselines`;
+`CHECKPOINT_SELECTION_METHODOLOGY.md` §8 (ön-kayıt). **Kaynak.** L21, L23, [[paper-scope]].
+
+## L26 — Determinizm bir optimizasyon lisansıdır: eval view'ı iki kez okuma (2026-07-28)
+
+**Bağlam.** Validation maliyeti bütçeyi belirliyor: ölçüldü, **bir eval ≈ 2.1 training epoch**
+(367 s vs 173 s). Bu yüzden `val_schedule` bir "ölçüm sıklığı" değil, plato çözünürlüğünü duvar
+saatiyle takas eden bir karar (L22). Soru "her epoch validate edebilir miyiz" olunca maliyetin
+nereden geldiğine bakıldı.
+
+**Bulgu.** `validate()` `eval_ld`'yi **iki kez** dolaşıyordu — önce `recompute_bn_stats` (precise-BN),
+sonra feature çıkarımı. Ama `mode="eval"` **deterministik**: tek merkezlenmiş crop, augmentasyon yok,
+`_view(..., training=False)` RNG'ye hiç dokunmuyor (tümör crop'u yalnız `training=True` iken jitter
+uyguluyor). Yani 200 deneğin 4 modalitesi **birebir aynı tensörler için** iki kez gzip'ten açılıyordu.
+Validation'ın hacim okumasının **üçte biri** buydu (600 → 400 okuma).
+
+**Ders.**
+1. **Determinizmi önce kanıtla, sonra kullan.** İki bağımsız geçişin `torch.equal` ile aynı çıktığı
+   gerçek deneklerde doğrulandı; ancak ondan sonra materialize etmek "numerik olarak eşdeğer"dir.
+   Kanıtlanmamış determinizm varsayımıyla yapılan cache, sessizce farklı sonuç üretir.
+2. **Ölçmeden optimize etme, ölçtükten sonra da tahmine güvenme.** Tahmin ~250 s idi; probe 3 eval'de
+   230/350/170 s verdi (ortalama 250 s, ama **contention'a göre 2 kat oynuyor**). Tek ölçüm alsaydık
+   170 de 350 de yanıltıcı olurdu.
+3. **Maliyeti kalıcı olarak logla.** `[val NNN] ... time=XXXs` eklendi — cadence kararı artık her
+   run'da denetlenebilir, iş bittikten sonra duvar saatinden geri-hesaplanması gerekmiyor.
+4. `recompute_bn_stats` zaten herhangi bir iterable kabul ediyordu; DataLoader yerine materialize
+   edilmiş liste vermek imza değişikliği gerektirmedi. **Gevşek tip beklentisi burada işe yaradı.**
+
+**Sonuç.** Eval 367 s → **250 s (%32)**. `val_every: 1` 15.1 h → **11.9 h/run**; 5 run için
+76 → **59 GPU-saat**. Bellek: MaxRSS 46 GB / 120 GB (materialize edilen tensörler ~7 GB).
+Maliyet: ~45 dk uygulama + probe.
+
+**Uygulandı.** `train_simsiam.validate` (`eval_batches = list(eval_ld)`, `pin_memory=False`),
+`utils.recompute_bn_stats` docstring, `[val]` satırına `time=`. Smoke exit 0.
+**Kaynak.** L22, `logs/probe_evalcost_10087.out`.
+
+## L27 — Ölçüm bütçesini bir probe'dan çıkaramazsın; ve bir koşuyu elerken gerekçe sonuçtan ÖNCE yazılır (2026-07-29)
+
+**Bağlam.** `val_every: 1`'e geçme kararı, tek işlik bir probe'da ölçülen **250 s**'lik eval
+maliyetine dayanıyordu (L26). Altı iş birden koşunca gerçek maliyet **493 s**'ye çıktı ve tahmin
+11.9 h/run yerine 19.4 h/run oldu — deadline'ı 4 saat aşacak şekilde.
+
+**Ders 1 — contention bir ölçüm parametresidir.** Aynı kod, aynı kohort, aynı node tipi:
+ai01'de 2 ağır iş varken eval **355 s**, ai02'de 4 ağır iş varken **~650 s**. Fark tamamen paylaşımlı
+NFS'ten gzipped NIfTI okuma yarışı. Yani bir probe'dan çıkarılan "per-run maliyet" ancak **probe'un
+koştuğu yük altında** geçerlidir; üretim yükünü temsil etmiyorsa plan yanlış çıkar. Bütçe ölçümü
+hedef eşzamanlılıkta yapılmalı.
+
+**Ders 2 — ortak-epoch kesme, `last.pth`'ten daha kontrollüdür.** Koşular farklı hızlarda
+ilerlediğinde `last.pth` her seed'de başka bir epoch demektir; onu "final/plateau" kolu diye
+raporlamak, kolun içine seed'e göre değişen bir eğitim miktarı gömer. Ortak bir `ckpt_eNNN.pth`
+seçmek hem bu karışıklığı kaldırır hem de erken kesmeyi meşrulaştırır — yeter ki plato gerçekten
+oturmuş olsun. Burada oturmuştu: epoch 40–52 arası `val_loss` aralığı 0.0047 (ön-kayıtlı
+`plateau_tol` = 0.01'in altında), RankMe 6.38–6.91.
+
+**Ders 3 — bir koşuyu elerken sınırlayıcı büyüklük "ortak epoch"tur, ortalama değil.**
+Ortak kesme epoch'unu **en geriden gelen koşu** belirler. seed47 (ai02'de 4 iş arasında sıkışmış,
+e38) tutulursa ortak epoch 49 ve Pareto plato havuzu **~9 nokta**; çıkarılırsa 69 ve **~29 nokta**.
+L23 havuz 13–16 nokta iken kuralın kendi hiperparametrelerine kararsız olduğunu ölçmüştü — 9 nokta
+o eşiğin altındadır. Yani "6 zayıf seed" değil **"5 sağlam seed"** doğru seçim: seed sayısı tek
+başına değil, her seed'in taşıdığı karar-verilebilirlikle birlikte anlamlı.
+
+**Ders 4 — eleme gerekçesi sonuçtan önce yazılır, yoksa savunulamaz.** seed47 hatalı değil
+(logundaki 1360 "hata" satırının hepsi bilinen zararsız `/tmp/pymp` temizlik gürültüsü); yalnızca
+SLURM onu yoğun node'a yerleştirmiş. Ölçüt **node yerleşimi kaynaklı ilerleme hızı**, hiçbir metrik
+ya da AUC değeri değil. Bu ayrım ancak **kayıt tarihi sonuçların üretim tarihinden önceyse**
+denetlenebilir; bu yüzden karar `tasks/todo.md` §C.4'e downstream hiç koşulmadan yazıldı.
+Sonuçlara bakıp seed elemek cherry-picking'dir; operasyonel eleme değildir — ama ikisini ayıran
+tek şey kayıttır.
+
+**Kaynak.** L23 (Pareto havuz büyüklüğü), L26 (probe ölçümü), `tasks/todo.md` §C.4.
+
 ## Kaynak etiketleri
 `MODEL_SELECTION.md` ve `DESIGN_JUSTIFICATION.md` sonundaki listeyle aynı.
+
+## L28 — Danışman dokümanı sonuç kataloğu değil, karar zinciri olmalıdır (2026-07-30)
+
+**Bağlam.** İlk teknik doküman tabloları, policy tanımları ve figürleri içeriyordu; ancak okuyucuya
+her deneyin hangi soruyu yanıtladığını ve şekillerden hangi sonucun çıkarılabileceğini sistematik
+olarak göstermiyordu. Ayrıca Markdown/LaTeX yazımı PDF üreticisinde gerçek matematik olarak
+işlenmediğinden bazı formüller görsel olarak bozuluyordu.
+
+**Kural.** Danışman veya hakem için hazırlanan her sonuç bölümünde şu sıra korunur:
+(1) deney sorusu, (2) sabit tutulanlar ve karşılaştırılanlar, (3) tablo/figürün nasıl okunacağı,
+(4) verinin desteklediği sınırlı çıkarım ve (5) belirsizlik/sınır. Teknik terimler English kalır;
+açıklama metni Türkçe yazılır. PDF motoru matematik render etmiyorsa LaTeX kaynak metni bırakmak
+yerine Unicode ile basılabilen, açık eşdeğer ifade kullanılmalıdır.
